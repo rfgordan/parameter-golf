@@ -1,0 +1,21 @@
+[
+  {
+    "run_name": "smoke_baseline_seq1024",
+    "git_ref": "main",
+    "env_overrides": {
+      "ITERATIONS": "200",
+      "TRAIN_LOG_EVERY": "20",
+      "VAL_LOSS_EVERY": "100"
+    }
+  },
+  {
+    "run_name": "smoke_seq2048",
+    "git_ref": "main",
+    "env_overrides": {
+      "ITERATIONS": "200",
+      "TRAIN_SEQ_LEN": "2048",
+      "TRAIN_LOG_EVERY": "20",
+      "VAL_LOSS_EVERY": "100"
+    }
+  }
+]
