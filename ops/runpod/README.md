@@ -1,30 +1,33 @@
 # Runpod Experiment Setup
 
-This directory contains the minimal Runpod execution layer for this repository:
+This directory contains the Runpod Pod execution layer for this repository:
 
+- `controller.py`: creates Pods, starts runs in `tmux`, polls status, and egresses results
 - `worker.py`: runs exactly one Parameter Golf experiment and persists results
-- `controller.py`: submits async Runpod Serverless jobs, polls status, and renders summaries
-- `serverless_handler.py`: Runpod Serverless handler entrypoint
+- `remote_bootstrap.sh`: remote Pod bootstrap that clones the repo and launches the run in `tmux`
 
 ## Ordering
 
-1. Create a restricted Runpod API key.
-2. Create one network volume in the datacenter you want to use.
-3. Choose the exact H100 SKU for the endpoint.
-4. Build and deploy a Serverless image that invokes `python3 /workspace/parameter-golf/ops/runpod/serverless_handler.py`.
-5. Create a Serverless endpoint with `gpuCount=1`, `workersMin=0`, and `workersMax=2`.
-6. Mount the network volume on the endpoint at `/runpod-volume`.
-7. Use `controller.py submit` to launch runs and `controller.py summarize` to render summaries.
-8. Use a separate debug Pod for interactive debugging only.
+1. Install and configure `runpodctl` locally with your Runpod API key.
+2. Ensure your SSH public key is attached to your Runpod account.
+3. Set `RUNPOD_TEMPLATE_ID` for the official Parameter Golf Pod template, or rely on `RUNPOD_IMAGE_NAME`.
+4. Use `controller.py submit` to create one Pod per run.
+5. Use `controller.py watch --watch` to monitor active runs and receive local-shell notifications.
+6. Use `controller.py attach --run-id ...` to print a `tmux` attach command if you want to inspect a live run.
+7. The controller copies the final remote run directory to `.runpod/results/` and then deletes the Pod.
 
 ## What You Need To Do
 
-- Create the Runpod API key and export it as `RUNPOD_API_KEY`.
-- Create the network volume and endpoint, then provide/export:
-  - `RUNPOD_ENDPOINT_ID`
-  - `RUNPOD_VOLUME_ID`
-- Build/deploy the Serverless image in Runpod.
-- Choose whether the worker image preloads dataset assets or downloads them into `/runpod-volume/data/`.
+- Configure `runpodctl` with your Runpod API key.
+- Add an SSH public key to your Runpod account so Pods can be reached over SSH.
+- Set the Pod template ID or image name:
+  - `RUNPOD_TEMPLATE_ID`
+  - optional fallback `RUNPOD_IMAGE_NAME`
+- Optionally override:
+  - `RUNPOD_GPU_TYPE`
+  - `PARAMETER_GOLF_NOTIFY_CMD`
+  - `PARAMETER_GOLF_DATASET_VARIANT`
+  - `PARAMETER_GOLF_TRAIN_SHARDS`
 
 ## Worker Payload
 
@@ -45,7 +48,7 @@ The worker accepts a single JSON payload:
 
 ## Persistent Output Layout
 
-Each run writes to a unique directory under `/runpod-volume/runs/`:
+Each run writes to a unique remote directory on the Pod and is then copied locally under `.runpod/results/`:
 
 - `config.json`
 - `metrics.json`
@@ -54,8 +57,8 @@ Each run writes to a unique directory under `/runpod-volume/runs/`:
 - `logs/` from the trainer
 - final model artifacts if produced
 
-Workers must never update a shared file on the network volume.
+Runs do not rely on a network volume in this version. Dataset download happens per Pod.
 
 ## Local Controller State
 
-The controller persists API responses locally under `.runpod/controller/`. This is the durable record for job IDs and terminal summaries; async Runpod job output should be treated as temporary.
+The controller persists run state locally under `.runpod/controller/`. This is the durable record for Pod IDs, SSH info, `tmux` session names, and terminal status.

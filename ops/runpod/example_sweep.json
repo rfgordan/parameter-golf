@@ -2,6 +2,7 @@
   {
     "run_name": "smoke_baseline_seq1024",
     "git_ref": "main",
+    "gpu_id": "NVIDIA H100 80GB HBM3",
     "env_overrides": {
       "ITERATIONS": "200",
       "TRAIN_LOG_EVERY": "20",
@@ -11,6 +12,7 @@
   {
     "run_name": "smoke_seq2048",
     "git_ref": "main",
+    "gpu_id": "NVIDIA H100 80GB HBM3",
     "env_overrides": {
       "ITERATIONS": "200",
       "TRAIN_SEQ_LEN": "2048",

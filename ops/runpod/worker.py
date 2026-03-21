@@ -59,10 +59,15 @@ def read_payload(path: str | None) -> dict[str, Any]:
 
 
 def resolve_run_paths(run_name: str) -> RunPaths:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    suffix = slugify(run_name)
-    run_dir = DEFAULT_RUNS_ROOT / f"{stamp}_{suffix}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    fixed_run_dir = os.environ.get("PARAMETER_GOLF_FIXED_RUN_DIR")
+    if fixed_run_dir:
+        run_dir = Path(fixed_run_dir).expanduser()
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        suffix = slugify(run_name)
+        run_dir = DEFAULT_RUNS_ROOT / f"{stamp}_{suffix}"
+        run_dir.mkdir(parents=True, exist_ok=False)
     return RunPaths(
         run_dir=run_dir,
         stdout_log=run_dir / "stdout.log",
