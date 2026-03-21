@@ -26,7 +26,10 @@ DEFAULT_IMAGE_NAME = os.environ.get("RUNPOD_IMAGE_NAME", "runpod/parameter-golf:
 DEFAULT_CONTAINER_DISK_GB = int(os.environ.get("RUNPOD_CONTAINER_DISK_GB", "100"))
 DEFAULT_VOLUME_GB = int(os.environ.get("RUNPOD_VOLUME_GB", "30"))
 DEFAULT_CLOUD_TYPE = os.environ.get("RUNPOD_CLOUD_TYPE", "SECURE")
-DEFAULT_POLL_INTERVAL = float(os.environ.get("PARAMETER_GOLF_POLL_INTERVAL", "15"))
+DEFAULT_POLL_INTERVAL = float(os.environ.get("PARAMETER_GOLF_POLL_INTERVAL", "5"))
+DEFAULT_SSH_POLL_INTERVAL_FAST = float(os.environ.get("PARAMETER_GOLF_SSH_POLL_INTERVAL_FAST", "2"))
+DEFAULT_SSH_POLL_INTERVAL_SLOW = float(os.environ.get("PARAMETER_GOLF_SSH_POLL_INTERVAL_SLOW", "10"))
+DEFAULT_SSH_POLL_FAST_WINDOW = float(os.environ.get("PARAMETER_GOLF_SSH_POLL_FAST_WINDOW", "60"))
 DEFAULT_DATASET_VARIANT = os.environ.get("PARAMETER_GOLF_DATASET_VARIANT", "sp1024")
 DEFAULT_TRAIN_SHARDS = int(os.environ.get("PARAMETER_GOLF_TRAIN_SHARDS", "80"))
 DEFAULT_REMOTE_ROOT_BASE = os.environ.get("PARAMETER_GOLF_REMOTE_ROOT_BASE", "/root/parameter-golf-runner")
@@ -89,7 +92,10 @@ def notify(event: str, record: dict[str, Any], extra: str | None = None) -> None
     pod_id = ((record.get("pod") or {}).get("id")) or "-"
     run_name = record.get("run_name", "-")
     local_dir = record.get("local_result_dir", "")
+    tmux_session = ((record.get("remote") or {}).get("tmux_session")) or ""
     message = f"\a[{event}] run={run_name} pod={pod_id}"
+    if tmux_session:
+        message += f" TMUX={tmux_session}"
     if extra:
         message += f" {extra}"
     if local_dir:
@@ -336,7 +342,8 @@ def create_pod(record: dict[str, Any]) -> str:
 
 def wait_for_ssh(record: dict[str, Any], timeout_seconds: int = 900) -> SSHSpec:
     pod_id = record["pod"]["id"]
-    deadline = time.time() + timeout_seconds
+    started = time.time()
+    deadline = started + timeout_seconds
     last_error = None
     while time.time() < deadline:
         result = run_command(["runpodctl", "ssh", "info", pod_id], check=False)
@@ -359,7 +366,9 @@ def wait_for_ssh(record: dict[str, Any], timeout_seconds: int = 900) -> SSHSpec:
                 return spec
         else:
             last_error = output
-        time.sleep(10)
+        elapsed = time.time() - started
+        interval = DEFAULT_SSH_POLL_INTERVAL_FAST if elapsed < DEFAULT_SSH_POLL_FAST_WINDOW else DEFAULT_SSH_POLL_INTERVAL_SLOW
+        time.sleep(interval)
     raise RuntimeError(f"timed out waiting for ssh info for pod {pod_id}: {last_error}")
 
 
@@ -492,7 +501,7 @@ def submit_runs(batch_file: Path, watch: bool) -> None:
 
 
 def render_table(rows: list[dict[str, Any]]) -> str:
-    headers = ["run_id", "run_name", "pod_id", "status", "gpu", "local_result_dir"]
+    headers = ["run_id", "run_name", "pod_id", "status", "tmux_session", "gpu", "local_result_dir"]
     widths = {header: len(header) for header in headers}
     for row in rows:
         for header in headers:
@@ -517,6 +526,7 @@ def summarize_runs() -> None:
                 "run_id": record.get("run_id", ""),
                 "pod_id": ((record.get("pod") or {}).get("id")) or "",
                 "status": record.get("status", ""),
+                "tmux_session": ((record.get("remote") or {}).get("tmux_session")) or "",
                 "gpu": ((record.get("pod") or {}).get("gpu_type")) or "",
                 "local_result_dir": record.get("local_result_dir", ""),
             }
@@ -526,6 +536,7 @@ def summarize_runs() -> None:
 
 def watch_runs(*, watch: bool, interval: float) -> None:
     runs_dir, _, _ = ensure_state()
+    last_render = None
     while True:
         pending = 0
         rows = []
@@ -539,6 +550,7 @@ def watch_runs(*, watch: bool, interval: float) -> None:
                         "run_name": record.get("run_name", ""),
                         "pod_id": ((record.get("pod") or {}).get("id")) or "",
                         "status": status,
+                        "tmux_session": ((record.get("remote") or {}).get("tmux_session")) or "",
                         "gpu": ((record.get("pod") or {}).get("gpu_type")) or "",
                         "local_result_dir": record.get("local_result_dir", ""),
                     }
@@ -565,6 +577,7 @@ def watch_runs(*, watch: bool, interval: float) -> None:
                             "run_name": record.get("run_name", ""),
                             "pod_id": ((record.get("pod") or {}).get("id")) or "",
                             "status": "egress_failed",
+                            "tmux_session": ((record.get("remote") or {}).get("tmux_session")) or "",
                             "gpu": ((record.get("pod") or {}).get("gpu_type")) or "",
                             "local_result_dir": record.get("local_result_dir", ""),
                         }
@@ -584,11 +597,15 @@ def watch_runs(*, watch: bool, interval: float) -> None:
                     "run_name": record.get("run_name", ""),
                     "pod_id": ((record.get("pod") or {}).get("id")) or "",
                     "status": read_json(path).get("status", ""),
+                    "tmux_session": ((record.get("remote") or {}).get("tmux_session")) or "",
                     "gpu": ((record.get("pod") or {}).get("gpu_type")) or "",
                     "local_result_dir": record.get("local_result_dir", ""),
                 }
             )
-        print(render_table(rows))
+        render = render_table(rows)
+        if render != last_render:
+            print(render)
+            last_render = render
         if not watch or pending == 0:
             break
         time.sleep(interval)

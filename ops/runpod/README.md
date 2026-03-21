@@ -16,6 +16,12 @@ This directory contains the Runpod Pod execution layer for this repository:
 6. Use `controller.py attach --run-id ...` to print a `tmux` attach command if you want to inspect a live run.
 7. The controller copies the final remote run directory to `.runpod/results/` and then deletes the Pod.
 
+The controller is optimized for quick actionable updates without noisy repeated output:
+
+- SSH readiness is polled aggressively at first so the run can start as soon as the Pod is reachable.
+- `watch --watch` only reprints the status table when the rendered state changes.
+- Notifications and summaries include the `tmux` session name by default so it is obvious what to attach to.
+
 ## What You Need To Do
 
 - Configure `runpodctl` with your Runpod API key.

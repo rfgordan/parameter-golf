@@ -15,7 +15,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RUNS_ROOT = Path(os.environ.get("PARAMETER_GOLF_RUNS_ROOT", "/runpod-volume/runs"))
+DEFAULT_RUNS_ROOT = Path(os.environ.get("PARAMETER_GOLF_RUNS_ROOT", ".runpod/runs"))
 DEFAULT_TRAIN_SCRIPT = os.environ.get("PARAMETER_GOLF_TRAIN_SCRIPT", "train_gpt.py")
 DEFAULT_TRAIN_COMMAND = os.environ.get(
     "PARAMETER_GOLF_TRAIN_COMMAND",

@@ -12,3 +12,4 @@ logs/
 .runpod/
 .runpod-volume/
 runpod-volume/
+.python-version
