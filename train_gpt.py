@@ -58,6 +58,12 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    
+    # Eval params
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 1024))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -214,6 +220,72 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+def eval_val_strided(
+        args: Hyperparameters,
+        model: nn.Module,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        grad_accum_steps: int,
+        val_tokens: Tensor,
+        base_bytes_lut: Tensor,
+        has_leading_space_lut: Tensor
+) -> tuple[float, float]:
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    
+    total_tokens = val_tokens.numel() - 1
+
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+
+    local_batch_ws = local_batch_tokens // args.eval_stride
+    total_batch_ws = (val_tokens.numel() - 1) // args.eval_stride
+    
+    window_starts = [ws for ws in range(0, total_tokens, args.eval_stride) if min(ws + args.eval_seq_len, total_tokens) - ws >= args.eval_seq_len]
+    total_windows = len(window_starts)
+
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_window_starts = window_starts[my_s:my_e]
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_window_starts), args.eval_batch_seqs):
+            batch_ws = my_window_starts[bi:bi + args.eval_batch_seqs]
+            bsz = len(batch_ws)
+
+            x_batch = torch.zeros((bsz, args.eval_seq_len), device=device, dtype=torch.int64)
+            y_batch = torch.zeros((bsz, args.eval_seq_len), device=device, dtype=torch.int64)
+            wlens : list[int]  = []
+            for i, ws in enumerate(batch_ws):
+                wend = min(ws + args.eval_seq_len, total_tokens + 1)
+                wlens.append(wend - ws)
+
+                sstart = max(ws, wend - args.eval_stride)
+                ctokens = val_tokens[ws:sstart].to(device=device, dtype=torch.int64, non_blocking=True)
+                xc = ctokens.reshape(-1, args.eval_seq_len)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = model.forward_logits(xc).detach()
+
+                yc = logits.argmax(dim=0).reshape(-1, args.eval_seq_len) 
+                wtokens = val_tokens[ws:wend].to(device=device, dtype=torch.int64, non_blocking=True)
+
+                x_batch[i, :] = wtokens
+                y_batch[i, :sstart] = yc
+                y_batch[i, sstart:] = wtokens[sstart:]
+
 
 
 def eval_val(
@@ -722,6 +794,30 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+    
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return logits
 
 
 # -----------------------------
