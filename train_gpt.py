@@ -234,12 +234,9 @@ def eval_val_strided(
         has_leading_space_lut: Tensor,
         is_boundary_token_lut: Tensor
 ) -> tuple[float, float]:
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.eval_seq_len:
+    if args.eval_stride > args.eval_seq_len:
         raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
+            f"EVAL_STRIDE must be > EVAL_SEQ_LEN. got EVAL_STRIDE={args.eval_stride}, EVAL_SEQ_LEN={args.eval_seq_len} "
         )
     
     total_tokens = val_tokens.numel() - 1
