@@ -243,6 +243,26 @@ def load_runs(batch_file: Path) -> list[dict[str, Any]]:
     raise ValueError("batch file must contain a JSON object or list of objects")
 
 
+def prepare_payload(
+    payload: dict[str, Any],
+    remote_root: str,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    prepared = json.loads(json.dumps(payload))
+    uploads: list[dict[str, str]] = []
+    local_model_path = prepared.pop("local_model_path", None)
+    if local_model_path:
+        local_path = Path(str(local_model_path)).expanduser().resolve()
+        if not local_path.is_file():
+            raise FileNotFoundError(f"local_model_path does not exist: {local_path}")
+        remote_model_dir = f"{remote_root}/inputs"
+        remote_model_path = f"{remote_model_dir}/{local_path.name}"
+        env_overrides = prepared.setdefault("env_overrides", {})
+        env_overrides.setdefault("INIT_MODEL_PATH", remote_model_path)
+        env_overrides.setdefault("EVAL_ONLY", "1")
+        uploads.append({"local_path": str(local_path), "remote_path": remote_model_path})
+    return prepared, uploads
+
+
 def record_path_for(run_id: str) -> Path:
     runs_dir, _, _ = ensure_state()
     return runs_dir / f"{run_id}.json"
@@ -267,21 +287,22 @@ def make_record(payload: dict[str, Any]) -> tuple[dict[str, Any], Path]:
     run_id = f"{stamp}_{slug}"
     remote_root = f"{DEFAULT_REMOTE_ROOT_BASE}/{run_id}"
     remote_run_dir = f"{remote_root}/run"
+    prepared_payload, uploads = prepare_payload(payload, remote_root)
     payload_path = tmp_dir / f"{run_id}.payload.json"
     local_result_dir = results_root / run_id
     record = {
         "run_id": run_id,
-        "run_name": payload["run_name"],
-        "payload": payload,
+        "run_name": prepared_payload["run_name"],
+        "payload": prepared_payload,
         "created_at": utc_now(),
         "status": "created",
         "events": [{"at": utc_now(), "status": "created"}],
         "pod": {
             "name": f"pg-{slug[:35]}-{stamp.lower()}",
-            "gpu_type": payload.get("gpu_id") or DEFAULT_GPU_TYPE,
-            "template_id": payload.get("template_id") or DEFAULT_TEMPLATE_ID,
-            "image_name": payload.get("image_name") or DEFAULT_IMAGE_NAME,
-            "cloud_type": str(payload.get("cloud_type") or DEFAULT_CLOUD_TYPE).upper(),
+            "gpu_type": prepared_payload.get("gpu_id") or DEFAULT_GPU_TYPE,
+            "template_id": prepared_payload.get("template_id") or DEFAULT_TEMPLATE_ID,
+            "image_name": prepared_payload.get("image_name") or DEFAULT_IMAGE_NAME,
+            "cloud_type": str(prepared_payload.get("cloud_type") or DEFAULT_CLOUD_TYPE).upper(),
         },
         "remote": {
             "root": remote_root,
@@ -291,11 +312,12 @@ def make_record(payload: dict[str, Any]) -> tuple[dict[str, Any], Path]:
         },
         "local_payload_path": str(payload_path),
         "local_result_dir": str(local_result_dir),
-        "git_ref": payload.get("git_ref") or DEFAULT_GIT_REF,
-        "repo_url": payload.get("repo_url") or DEFAULT_REPO_URL,
-        "hold_open": bool(payload.get("hold_open", False)),
+        "git_ref": prepared_payload.get("git_ref") or DEFAULT_GIT_REF,
+        "repo_url": prepared_payload.get("repo_url") or DEFAULT_REPO_URL,
+        "hold_open": bool(prepared_payload.get("hold_open", False)),
+        "uploads": uploads,
     }
-    write_json(payload_path, payload)
+    write_json(payload_path, prepared_payload)
     save_record(record)
     return record, payload_path
 
@@ -395,6 +417,10 @@ def start_remote_run(record: dict[str, Any], payload_path: Path) -> None:
     )
     ssh_run(spec, f"mkdir -p {shlex.quote(record['remote']['root'])}")
     scp_to_remote(spec, payload_path, record["remote"]["payload_path"])
+    for upload in record.get("uploads", []):
+        remote_parent = str(Path(upload["remote_path"]).parent)
+        ssh_run(spec, f"mkdir -p {shlex.quote(remote_parent)}")
+        scp_to_remote(spec, Path(upload["local_path"]), upload["remote_path"])
     remote_script = REPO_ROOT / "ops" / "runpod" / "remote_bootstrap.sh"
     remote_cmd = (
         f"PARAMETER_GOLF_DATASET_VARIANT={shlex.quote(str(record['payload'].get('dataset_variant', DEFAULT_DATASET_VARIANT)))} "
