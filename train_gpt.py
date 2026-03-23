@@ -61,6 +61,7 @@ class Hyperparameters:
     
     # Strided Attn Params
     eval_strided_attn = bool(int(os.environ.get("EVAL_STRIDED_ATTN", "0")))
+    eval_doc_separated = bool(int(os.environ.get("EVAL_DOC_SEPARATED", "1")))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 1024))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
@@ -222,6 +223,34 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
 
+BOS_ID = 1
+
+def find_documents(all_tokens: Tensor, include_next_bos: bool = True) -> list[tuple[int, int]]:
+    """Return (start_offset, length) spans for BOS-delimited documents."""
+    bos_positions = (all_tokens == BOS_ID).nonzero(as_tuple=True)[0].tolist()
+    if not bos_positions:
+        return [(0, int(all_tokens.numel()))]
+    docs = []
+    for i, start in enumerate(bos_positions):
+        end = bos_positions[i + 1] if i + 1 < len(bos_positions) else int(all_tokens.numel())
+        if include_next_bos and i + 1 < len(bos_positions):
+            end += 1
+        if end - start >= 2:
+            docs.append((int(start), int(end - start)))
+    return docs
+
+def doc_eval_chunks(pred_len: int, eval_seq_len: int, eval_stride: int) -> list[tuple[int, int]]:
+    if pred_len <= 0:
+        return []
+    first_end = min(pred_len, eval_seq_len)
+    chunks = [(0, first_end)]
+    chunk_start = first_end
+    while chunk_start < pred_len:
+        chunk_end = min(chunk_start + eval_stride, pred_len)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end
+    return chunks
+
 def eval_val_strided(
         args: Hyperparameters,
         model: nn.Module,
@@ -234,21 +263,39 @@ def eval_val_strided(
         has_leading_space_lut: Tensor,
         is_boundary_token_lut: Tensor
 ) -> tuple[float, float]:
+    if args.eval_stride <= 0 or args.eval_seq_len <= 0 or args.eval_batch_seqs <= 0:
+        raise ValueError(
+            f"EVAL_SEQ_LEN, EVAL_STRIDE, and EVAL_BATCH_SEQS must be positive; "
+            f"got EVAL_SEQ_LEN={args.eval_seq_len}, EVAL_STRIDE={args.eval_stride}, "
+            f"EVAL_BATCH_SEQS={args.eval_batch_seqs}"
+        )
     if args.eval_stride > args.eval_seq_len:
         raise ValueError(
-            f"EVAL_STRIDE must be > EVAL_SEQ_LEN. got EVAL_STRIDE={args.eval_stride}, EVAL_SEQ_LEN={args.eval_seq_len} "
+            f"EVAL_STRIDE must be <= EVAL_SEQ_LEN; got EVAL_STRIDE={args.eval_stride}, "
+            f"EVAL_SEQ_LEN={args.eval_seq_len}"
         )
-    
-    total_tokens = val_tokens.numel() - 1
-    
 
-    chunk_bounds = [(cs, min(cs + args.eval_stride, total_tokens)) for cs in range(0, total_tokens, args.eval_stride)]
+    if args.eval_doc_separated:
+        # Keep the next BOS attached to the previous document so token/byte accounting
+        # stays aligned with the repo's continuous-stream validation metric.
+        docs = find_documents(val_tokens, include_next_bos=True)
+    else:
+        docs = [(0, int(val_tokens.numel()))]
+    my_s = (len(docs) * rank) // world_size
+    my_e = (len(docs) * (rank + 1)) // world_size
+    my_docs = docs[my_s:my_e]
 
-    total_chunks = len(chunk_bounds)
-
-    my_s = (total_chunks * rank) // world_size
-    my_e = (total_chunks * (rank + 1)) // world_size
-    my_chunk_bounds = chunk_bounds[my_s:my_e]
+    # Each chunk owns a unique predicted span within one document.
+    # The first chunk scores up to EVAL_SEQ_LEN tokens at once, then later chunks advance by EVAL_STRIDE.
+    my_chunks: list[tuple[int, int, int, int, int]] = []
+    for doc_start, doc_len in my_docs:
+        pred_len = doc_len - 1
+        for chunk_start, chunk_end in doc_eval_chunks(pred_len, args.eval_seq_len, args.eval_stride):
+            win_start = max(0, chunk_end - args.eval_seq_len)
+            win_len = chunk_end - win_start
+            chunk_offset = chunk_start - win_start
+            chunk_len = chunk_end - chunk_start
+            my_chunks.append((doc_start, win_start, win_len, chunk_offset, chunk_len))
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -256,24 +303,20 @@ def eval_val_strided(
 
     model.eval()
     with torch.inference_mode():
-        for bi in range(0, len(my_chunk_bounds), args.eval_batch_seqs):
-            batch_cs = my_chunk_bounds[bi:bi + args.eval_batch_seqs]
-            bsz = len(batch_cs)
+        for bi in range(0, len(my_chunks), args.eval_batch_seqs):
+            batch_chunks = my_chunks[bi:bi + args.eval_batch_seqs]
+            bsz = len(batch_chunks)
 
             x_batch = torch.zeros((bsz, args.eval_seq_len), device=device, dtype=torch.int64)
             y_batch = torch.zeros((bsz, args.eval_seq_len), device=device, dtype=torch.int64)
-            wlens : list[any]  = []
+            chunk_info: list[tuple[int, int]] = []
 
-            for i, (cs, ce) in enumerate(batch_cs):
-                ws = max(0, ce - args.eval_seq_len)
-                #wend = min(ws + args.eval_seq_len, total_tokens)
-                wlen = ce - ws
-
-                chunk = val_tokens[ws:ce+1].to(device=device, dtype=torch.int64, non_blocking=True)
-                x_batch[i, :wlen] = chunk[:-1]
-                y_batch[i, :wlen] = chunk[1:]
-
-                wlens.append((ws, wlen))
+            for i, (doc_start, win_start, win_len, chunk_offset, chunk_len) in enumerate(batch_chunks):
+                raw = val_tokens[doc_start + win_start : doc_start + win_start + win_len + 1]
+                toks = raw.to(device=device, dtype=torch.int64, non_blocking=True)
+                x_batch[i, :win_len] = toks[:-1]
+                y_batch[i, :win_len] = toks[1:]
+                chunk_info.append((chunk_offset, chunk_len))
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = model.forward_logits(x_batch).detach()
@@ -282,28 +325,26 @@ def eval_val_strided(
                 logits.reshape(-1, logits.size(-1)).float(), 
                 y_batch.reshape(-1), reduction="none").reshape((bsz, args.eval_seq_len))
 
-            for i, (cs, ce) in enumerate(batch_cs):
-                ws, wlen = wlens[i]
-                #s = 0 if ws == 0 else wlen - args.eval_stride
-                stride_nll = nll[i, cs - ws:wlen]
+            for i, (local_chunk_offset, local_chunk_len) in enumerate(chunk_info):
+                stride_nll = nll[i, local_chunk_offset : local_chunk_offset + local_chunk_len]
 
-                val_token_count += float(ce - cs)
+                val_token_count += float(local_chunk_len)
                 val_loss_sum += stride_nll.sum()
-                tgt_ids = y_batch[i, cs - ws:wlen]
-                prev_ids = x_batch[i, cs - ws:wlen]
+                tgt_ids = y_batch[i, local_chunk_offset : local_chunk_offset + local_chunk_len]
+                prev_ids = x_batch[i, local_chunk_offset : local_chunk_offset + local_chunk_len]
 
                 token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.float64)
                 token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.float64)
                 val_byte_count += token_bytes.to(torch.float64).sum()
 
             if rank == 0 and (bi // args.eval_batch_seqs) % 50 == 0:
-                done = min(bi + args.eval_batch_seqs, len(my_chunk_bounds))
-                pct = done / len(my_chunk_bounds) * 100
+                done = min(bi + args.eval_batch_seqs, len(my_chunks))
+                pct = done / len(my_chunks) * 100 if my_chunks else 100.0
                 running_bpb = 0.0
                 if val_token_count.item() > 0:
                     rl = (val_loss_sum / val_token_count).item()
                     running_bpb = rl / math.log(2.0) * (val_token_count.item() / val_byte_count.item())
-                print(f" sliding_eval [{pct:5.1f}%] {done}/{len(my_chunk_bounds)} windows running_bpb={running_bpb:.6f}", flush=True)
+                print(f" sliding_eval [{pct:5.1f}%] {done}/{len(my_chunks)} chunks running_bpb={running_bpb:.6f}", flush=True)
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
