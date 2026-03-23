@@ -13,3 +13,4 @@ logs/
 .runpod-volume/
 runpod-volume/
 .python-version
+run_results/
