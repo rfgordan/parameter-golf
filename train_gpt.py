@@ -1132,7 +1132,7 @@ class GPT(nn.Module):
         # save intermediate and final recurrent outputs for shortcut consistency loss
         h0 = torch.zeros_like(x)
         h1 = torch.zeros_like(x)
-        consist_idx = torch.randint(self.num_recurrent_loops, (1,)).item()
+        consist_idx = random.randrange(self.num_recurrent_loops)
 
         for i in range(self.num_recurrent_loops):
             if i == consist_idx:
