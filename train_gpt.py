@@ -72,6 +72,23 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    _explicit_split_depth = any(
+        name in os.environ for name in ("NUM_ENCODER_LAYERS", "NUM_RECURRENT_LAYERS", "NUM_DECODER_LAYERS")
+    )
+    if _explicit_split_depth:
+        num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 3))
+        num_recurrent_layers = int(os.environ.get("NUM_RECURRENT_LAYERS", 3))
+        num_decoder_layers = int(os.environ.get("NUM_DECODER_LAYERS", 3))
+    elif "NUM_LAYERS" in os.environ:
+        # Preserve the old baseline behavior when only the legacy total-depth knob is set.
+        num_encoder_layers = num_layers // 2
+        num_recurrent_layers = 0
+        num_decoder_layers = num_layers - num_encoder_layers
+    else:
+        num_encoder_layers = 3
+        num_recurrent_layers = 3
+        num_decoder_layers = 3
+    num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -473,7 +490,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb",
     ).split(",")
     if pattern
 )
@@ -915,13 +932,46 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+    
+class RecurrentBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+        max_recurrent_loop: int,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.loop_emb = nn.Parameter(torch.empty(max_recurrent_loop, dim))
+        nn.init.normal_(self.loop_emb, mean=0.0, std=0.02)
+
+    def forward(self, x: Tensor, x0: Tensor, it: int) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0 + self.loop_emb[it]
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
 
 
 class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        num_encoder_layers: int,
+        num_recurrent_mid_layers: int,
+        num_decoder_layers: int,
+        num_recurrent_loops: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -939,11 +989,15 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        # self.num_encoder_layers = num_layers // 2
+        # self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = num_encoder_layers
+        self.num_recurrent_mid_layers = num_recurrent_mid_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.num_recurrent_loops = num_recurrent_loops
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
+        self.encoder_blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
@@ -953,9 +1007,37 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(self.num_encoder_layers)
             ]
         )
+        self.recurrent_blocks = nn.ModuleList(
+            [
+                RecurrentBlock(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                    num_recurrent_loops,
+                )
+                for i in range(num_recurrent_mid_layers)
+            ]
+        )
+        self.decoder_blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for i in range(num_decoder_layers)
+            ]
+        )
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -970,29 +1052,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        logits = self.forward_logits(input_ids)
         targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
     
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1001,13 +1062,17 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
+        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.encoder_blocks[i](x, x0)
             skips.append(x)
+        for i in range(self.num_recurrent_loops):
+            for j in range(self.num_recurrent_mid_layers):
+                x = self.recurrent_blocks[j](x, x0, i)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.decoder_blocks[i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
@@ -1121,7 +1186,10 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        num_encoder_layers=args.num_encoder_layers,
+        num_recurrent_mid_layers=args.num_recurrent_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        num_recurrent_loops=args.num_recurrent_loops,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1131,6 +1199,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1150,7 +1219,9 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.encoder_blocks.named_parameters())
+    block_named_params.extend(base_model.recurrent_blocks.named_parameters())
+    block_named_params.extend(base_model.decoder_blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
