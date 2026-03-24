@@ -25,10 +25,10 @@ DEFAULT_TRAIN_COMMAND = os.environ.get(
 VAL_RE = re.compile(r"step:(?P<step>\d+)/(?P<iters>\d+) val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)")
 TRAIN_RE = re.compile(r"step:(?P<step>\d+)/(?P<iters>\d+) train_loss:(?P<train_loss>\S+)")
 ROUNDTRIP_RE = re.compile(
-    r"final_int8_zlib_roundtrip_exact val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)"
+    r"final_int(?:8|6)_zlib_roundtrip_exact val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)"
 )
-TOTAL_SIZE_RE = re.compile(r"Total submission size int8\+zlib: (?P<bytes>\d+) bytes")
-SERIALIZED_RE = re.compile(r"Serialized model int8\+zlib: (?P<bytes>\d+) bytes")
+TOTAL_SIZE_RE = re.compile(r"Total submission size int(?:8|6)\+zlib: (?P<bytes>\d+) bytes")
+SERIALIZED_RE = re.compile(r"Serialized model int(?:8|6)\+zlib: (?P<bytes>\d+) bytes")
 
 
 @dataclass
