@@ -41,6 +41,7 @@ Run pair 2, cleaner rerun:
 | strided | `eval_val_strided` | `20260322T230203Z_eval_path_compare_h100_strided_20260322` | success | [.runpod/results/20260322T230203Z_eval_path_compare_h100_strided_20260322](/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260322T230203Z_eval_path_compare_h100_strided_20260322) | [run_results/eval_path_compare_h100_20260322/strided](/Users/robertgordan/Projects/parameter-golf/run_results/eval_path_compare_h100_20260322/strided) |
 | baseline no-mid-val | non-strided `eval_val` | `20260323T164728Z_eval_path_compare_h100_baseline_noval_20260323` | success, partial local copy | [.runpod/results/20260323T164728Z_eval_path_compare_h100_baseline_noval_20260323](/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260323T164728Z_eval_path_compare_h100_baseline_noval_20260323) | [run_results/eval_path_compare_h100_20260322/baseline_noval_20260323](/Users/robertgordan/Projects/parameter-golf/run_results/eval_path_compare_h100_20260322/baseline_noval_20260323) |
 | strided no-mid-val | doc-aware `eval_val_strided` | `20260323T164756Z_eval_path_compare_h100_strided_noval_20260323` | success | [.runpod/results/20260323T164756Z_eval_path_compare_h100_strided_noval_20260323](/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260323T164756Z_eval_path_compare_h100_strided_noval_20260323) | [run_results/eval_path_compare_h100_20260322/strided_noval_20260323](/Users/robertgordan/Projects/parameter-golf/run_results/eval_path_compare_h100_20260322/strided_noval_20260323) |
+| strided sanity rerun | doc-aware `eval_val_strided` | `20260323T194305Z_full_train_sanity_strided_20260323` | success, partial local copy after controller egress failure | [.runpod/results/20260323T194305Z_full_train_sanity_strided_20260323](/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260323T194305Z_full_train_sanity_strided_20260323) | [run_results/eval_path_compare_h100_20260322/full_train_sanity_strided_20260323](/Users/robertgordan/Projects/parameter-golf/run_results/eval_path_compare_h100_20260322/full_train_sanity_strided_20260323) |
 
 ## Metrics To Capture
 
@@ -115,6 +116,27 @@ So the main conclusion is stable:
 - the strided/doc-aware eval path materially improves reported score
 - most of the practical pain comes from eval cost, not training instability
 - if this metric is used for serious comparisons, `VAL_LOSS_EVERY=0` is the cleaner way to benchmark it
+
+## Sanity Rerun On Current Code
+
+A follow-up sanity rerun on the current eval-only-debug branch checked whether the normal full training path still lands in the expected score range.
+
+| Metric | Current-code strided sanity rerun |
+| --- | --- |
+| commit | `e44d19fd015d03d1424367f9e36f13cb99091a93` |
+| final roundtrip val_loss | `2.17218458` |
+| final roundtrip val_bpb | `1.28649006` |
+| main val_bpb | `1.2854` |
+| compressed model bytes | `14103019` |
+| total submission bytes | `14163000` |
+| final eval time | `279916ms` |
+| wallclock stop step | `1535` |
+| pod cleanup | yes |
+
+Interpretation:
+- The current-code full training path behaves normally and stays in the same `~1.28` range as the earlier good strided training-path run (`1.27940328`).
+- It does not reproduce the bad eval-only `1024` control (`1.87817407`).
+- That makes the remaining bug much more specific: it is tied to the eval-only pathway or its runtime conditions, not to the ordinary training-path validation logic.
 
 ## Relevant Prior Work
 
