@@ -490,7 +490,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,adaLN_modulation,time_embedder",
     ).split(",")
     if pattern
 )
@@ -955,38 +955,73 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-    
-class RecurrentBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-        max_recurrent_loop: int,
-    ):
-        super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.loop_emb = nn.Parameter(torch.empty(max_recurrent_loop, dim))
-        nn.init.normal_(self.loop_emb, mean=0.0, std=0.02)
 
-    def forward(self, x: Tensor, x0: Tensor, it: int) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0 + self.loop_emb[it]
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+# ref: https://github.com/armenjeddi/loopformer/blob/master/model.py
+class LoopFormerBlock(nn.Module):
+
+    def __init__(self,
+                dim: int,
+                num_heads: int,
+                num_kv_heads: int,
+                mlp_mult: int,
+                rope_base: float,
+                qk_gain_init: float,
+        ):
+        super().__init__()
+        n_embed = dim
+        self.norm_1 = nn.RMSNorm(n_embed, elementwise_affine=False)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.norm_2 = nn.RMSNorm(n_embed, elementwise_affine=False)
+        self.mlp  = MLP(dim, mlp_mult)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(n_embed, 4 * n_embed, bias=True),
+        )
+
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        gate_msa, gate_mlp, scale_msa, scale_mlp = self.adaLN_modulation(c.to(dtype=torch.bfloat16)).chunk(4, dim=1)
+
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            self.norm_1(x) * (1 + scale_msa.unsqueeze(1))
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            self.norm_2(x) * (1 + scale_mlp.unsqueeze(1))
+        )
         return x
 
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
 
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+            device=t.device
+        )
+        args = t * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = t_freq.to(dtype=self.mlp[0].weight.dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+# LoopGPT
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1005,6 +1040,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
     ):
+        if num_recurrent_loops < 2:
+            raise ValueError("Code requires num_recurrent_loops > 1")
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -1035,18 +1072,19 @@ class GPT(nn.Module):
         )
         self.recurrent_blocks = nn.ModuleList(
             [
-                RecurrentBlock(
+                LoopFormerBlock(
                     model_dim,
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    num_recurrent_loops,
                 )
                 for i in range(num_recurrent_mid_layers)
             ]
         )
+        # one time step embedding, fixed step and trajectory length
+        self.time_embedder = TimestepEmbedder(model_dim)
         self.decoder_blocks = nn.ModuleList(
             [
                 Block(
@@ -1075,11 +1113,12 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.forward_logits(input_ids)
+        logits, h0, h1 = self.forward_internal(input_ids)
         targets = target_ids.reshape(-1)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        consistency_loss = F.mse_loss(h1.detach(), h0) * 0.1
+        return F.cross_entropy(logits.float(), targets, reduction="mean") + consistency_loss
     
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
+    def forward_internal(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1089,9 +1128,20 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.encoder_blocks[i](x, x0)
             skips.append(x)
+
+        # save intermediate and final recurrent outputs for shortcut consistency loss
+        h0 = torch.zeros_like(x)
+        h1 = torch.zeros_like(x)
+        consist_idx = torch.randint(self.num_recurrent_loops, (1)).item()
+
         for i in range(self.num_recurrent_loops):
+            if i == consist_idx:
+                h0.copy_(x)
+            ti = torch.ones((x.dim(0), 1), dtype=torch.bfloat16) * (i / self.num_recurrent_loops)
             for j in range(self.num_recurrent_mid_layers):
-                x = self.recurrent_blocks[j](x, x0, i)
+                c = self.time_embedder(ti)
+                x = self.recurrent_blocks[j](x, c)
+        h1.copy_(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -1105,8 +1155,11 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return logits, h0, h1
+    
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        logits, _, _ = self.forward_internal(input_ids)
         return logits
-
 
 # -----------------------------
 # TRAINING
