@@ -985,9 +985,12 @@ class LoopFormerBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(n_embed, 4 * n_embed, bias=True),
         )
-
-        nn.init.zeros_(self.adaLN_modulation[1].weight)
-        nn.init.zeros_(self.adaLN_modulation[1].bias)
+        # Keep the scale channels identity-initialized, but give the gates a
+        # small nonzero start so the recurrent path is not exactly dead.
+        mod = self.adaLN_modulation[1]
+        nn.init.zeros_(mod.weight)
+        nn.init.zeros_(mod.bias)
+        nn.init.normal_(mod.weight[: 2 * n_embed], mean=0.0, std=1e-3)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         gate_msa, gate_mlp, scale_msa, scale_mlp = self.adaLN_modulation(c.to(dtype=torch.bfloat16)).chunk(4, dim=1)
