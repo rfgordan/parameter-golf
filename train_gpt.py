@@ -1458,8 +1458,9 @@ def main() -> None:
         raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES must contain at least one integer")
     if sample_choices[0] < 1:
         raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES values must be >= 1")
-    if sample_choices[-1] > args.num_recurrent_loops:
-        raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES cannot exceed NUM_RECURRENT_LOOPS")
+    sample_choices = [choice for choice in sample_choices if choice <= args.num_recurrent_loops]
+    if not sample_choices:
+        raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES must include at least one value <= NUM_RECURRENT_LOOPS")
 
     def set_training_recurrent_loops(active_loops: int) -> None:
         base_model.set_active_recurrent_loops(active_loops)
