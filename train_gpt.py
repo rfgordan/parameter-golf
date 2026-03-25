@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
+from collections import defaultdict
 import glob
 import io
 import math
@@ -89,7 +90,12 @@ class Hyperparameters:
         num_recurrent_layers = 3
         num_decoder_layers = 3
     num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
-    consistency_loss_weight = float(os.environ.get("CONSISTENCY_LOSS_WEIGHT", 0.1))
+    recurrent_loop_schedule = bool(int(os.environ.get("RECURRENT_LOOP_SCHEDULE", "0")))
+    recurrent_loop_schedule_mode = os.environ.get("RECURRENT_LOOP_SCHEDULE_MODE", "auto")
+    recurrent_loop_schedule_first_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_FIRST_FRAC", 0.5))
+    recurrent_loop_schedule_second_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_SECOND_FRAC", 0.25))
+    recurrent_loop_sample = bool(int(os.environ.get("RECURRENT_LOOP_SAMPLE", "0")))
+    recurrent_loop_sample_choices = os.environ.get("RECURRENT_LOOP_SAMPLE_CHOICES", "1,2,3,4")
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -1031,7 +1037,6 @@ class GPT(nn.Module):
         num_recurrent_mid_layers: int,
         num_decoder_layers: int,
         num_recurrent_loops: int,
-        consistency_loss_weight: float,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -1057,7 +1062,7 @@ class GPT(nn.Module):
         self.num_recurrent_mid_layers = num_recurrent_mid_layers
         self.num_decoder_layers = num_decoder_layers
         self.num_recurrent_loops = num_recurrent_loops
-        self.consistency_loss_weight = consistency_loss_weight
+        self.active_recurrent_loops = num_recurrent_loops
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.encoder_blocks = nn.ModuleList(
@@ -1115,13 +1120,15 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def set_active_recurrent_loops(self, active_loops: int) -> None:
+        self.active_recurrent_loops = max(1, min(active_loops, self.num_recurrent_loops))
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits, h0, h1 = self.forward_internal(input_ids)
+        logits = self.forward_internal(input_ids)
         targets = target_ids.reshape(-1)
-        consistency_loss = F.mse_loss(h1.detach(), h0) * self.consistency_loss_weight
-        return F.cross_entropy(logits.float(), targets, reduction="mean") + consistency_loss
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
     
-    def forward_internal(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward_internal(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1132,14 +1139,7 @@ class GPT(nn.Module):
             x = self.encoder_blocks[i](x, x0)
             skips.append(x)
 
-        # save intermediate and final recurrent outputs for shortcut consistency loss
-        h0 = torch.zeros_like(x)
-        h1 = torch.zeros_like(x)
-        consist_idx = torch.randint(self.num_recurrent_loops, (), device=x.device)
-        consist_mask = F.one_hot(consist_idx, self.num_recurrent_loops).to(dtype=x.dtype)
-
-        for i in range(self.num_recurrent_loops):
-            h0 = h0 + consist_mask[i] * (x - h0)
+        for i in range(self.active_recurrent_loops):
             ti = torch.full(
                 (x.size(0), 1),
                 i / self.num_recurrent_loops,
@@ -1149,7 +1149,6 @@ class GPT(nn.Module):
             for j in range(self.num_recurrent_mid_layers):
                 c = self.time_embedder(ti)
                 x = self.recurrent_blocks[j](x, c)
-        h1.copy_(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -1163,11 +1162,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return logits, h0, h1
+        return logits
     
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        logits, _, _ = self.forward_internal(input_ids)
-        return logits
+        return self.forward_internal(input_ids)
 
 # -----------------------------
 # TRAINING
@@ -1274,7 +1272,6 @@ def main() -> None:
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
-        consistency_loss_weight=args.consistency_loss_weight,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1365,6 +1362,17 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.recurrent_loop_schedule:
+        log0(
+            "recurrent_loop_schedule:"
+            f"mode={args.recurrent_loop_schedule_mode} "
+            f"fractions=({args.recurrent_loop_schedule_first_frac:.2f},"
+            f"{args.recurrent_loop_schedule_second_frac:.2f},"
+            f"{1.0 - args.recurrent_loop_schedule_first_frac - args.recurrent_loop_schedule_second_frac:.2f}) "
+            f"loops=(1,{min(2, args.num_recurrent_loops)},{args.num_recurrent_loops})"
+        )
+    if args.recurrent_loop_sample:
+        log0(f"recurrent_loop_sample:choices={args.recurrent_loop_sample_choices}")
     log0(f"seed:{args.seed}")
     if args.init_model_path:
         log0(f"init_model_path:{args.init_model_path}")
@@ -1372,6 +1380,7 @@ def main() -> None:
         log0("eval_only:1")
 
     if args.eval_only:
+        base_model.set_active_recurrent_loops(base_model.num_recurrent_loops)
         torch.cuda.synchronize()
         t_eval = time.perf_counter()
         val_loss, val_bpb = run_validation(
@@ -1394,6 +1403,7 @@ def main() -> None:
             f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
             f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
         )
+        base_model.set_active_recurrent_loops(base_model.num_recurrent_loops)
         serialize_and_validate_roundtrip(
             args,
             code,
@@ -1427,6 +1437,88 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
+    if args.recurrent_loop_schedule_first_frac < 0.0 or args.recurrent_loop_schedule_second_frac < 0.0:
+        raise ValueError("RECURRENT_LOOP_SCHEDULE_*_FRAC must be non-negative")
+    if args.recurrent_loop_schedule_first_frac + args.recurrent_loop_schedule_second_frac > 1.0:
+        raise ValueError("RECURRENT_LOOP_SCHEDULE_FIRST_FRAC + SECOND_FRAC must be <= 1.0")
+    if args.recurrent_loop_schedule_mode not in {"auto", "time", "steps"}:
+        raise ValueError("RECURRENT_LOOP_SCHEDULE_MODE must be one of: auto, time, steps")
+
+    sample_choices = sorted(
+        {
+            int(value.strip())
+            for value in args.recurrent_loop_sample_choices.split(",")
+            if value.strip()
+        }
+    )
+    if not sample_choices:
+        raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES must contain at least one integer")
+    if sample_choices[0] < 1:
+        raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES values must be >= 1")
+    if sample_choices[-1] > args.num_recurrent_loops:
+        raise ValueError("RECURRENT_LOOP_SAMPLE_CHOICES cannot exceed NUM_RECURRENT_LOOPS")
+
+    def set_training_recurrent_loops(active_loops: int) -> None:
+        base_model.set_active_recurrent_loops(active_loops)
+
+    def set_eval_recurrent_loops() -> None:
+        base_model.set_active_recurrent_loops(base_model.num_recurrent_loops)
+
+    def recurrent_schedule_progress(step_idx: int, elapsed_ms: float) -> float:
+        if not args.recurrent_loop_schedule:
+            return 1.0
+        if args.recurrent_loop_schedule_mode == "time" or (
+            args.recurrent_loop_schedule_mode == "auto" and max_wallclock_ms is not None
+        ):
+            return min(max(elapsed_ms / max(max_wallclock_ms or 1.0, 1e-9), 0.0), 1.0)
+        return min(max(step_idx / max(args.iterations, 1), 0.0), 1.0)
+
+    def scheduled_recurrent_loops(step_idx: int, elapsed_ms: float) -> int:
+        if not args.recurrent_loop_schedule:
+            return base_model.num_recurrent_loops
+        progress = recurrent_schedule_progress(step_idx, elapsed_ms)
+        if progress < args.recurrent_loop_schedule_first_frac:
+            return 1
+        if progress < args.recurrent_loop_schedule_first_frac + args.recurrent_loop_schedule_second_frac:
+            return min(2, base_model.num_recurrent_loops)
+        return base_model.num_recurrent_loops
+
+    def sampled_recurrent_loops(max_active_loops: int) -> int:
+        if not args.recurrent_loop_sample:
+            return max_active_loops
+        allowed_choices = [choice for choice in sample_choices if choice <= max_active_loops]
+        if not allowed_choices:
+            return max_active_loops
+        if distributed:
+            sampled = torch.tensor(allowed_choices[0], device=device, dtype=torch.int64)
+            if rank == 0:
+                sampled.fill_(random.choice(allowed_choices))
+            dist.broadcast(sampled, src=0)
+            return int(sampled.item())
+        return random.choice(allowed_choices)
+
+    train_loss_sums: dict[int, float] = defaultdict(float)
+    train_loss_counts: dict[int, int] = defaultdict(int)
+    val_loss_sums: dict[int, float] = defaultdict(float)
+    val_bpb_sums: dict[int, float] = defaultdict(float)
+    val_counts: dict[int, int] = defaultdict(int)
+
+    def format_loop_train_stats() -> str:
+        parts = [
+            f"{loops}x(loss={train_loss_sums[loops] / train_loss_counts[loops]:.4f},n={train_loss_counts[loops]})"
+            for loops in sorted(train_loss_counts)
+            if train_loss_counts[loops] > 0
+        ]
+        return " ".join(parts)
+
+    def format_loop_val_stats() -> str:
+        parts = [
+            f"{loops}x(loss={val_loss_sums[loops] / val_counts[loops]:.4f},bpb={val_bpb_sums[loops] / val_counts[loops]:.4f},n={val_counts[loops]})"
+            for loops in sorted(val_counts)
+            if val_counts[loops] > 0
+        ]
+        return " ".join(parts)
+
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -1441,6 +1533,7 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        set_eval_recurrent_loops()
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1476,11 +1569,14 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    last_active_recurrent_loops: int | None = None
+    last_scheduled_recurrent_loops: int | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
+            set_eval_recurrent_loops()
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = run_validation(
@@ -1495,10 +1591,16 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            val_loss_sums[base_model.num_recurrent_loops] += val_loss
+            val_bpb_sums[base_model.num_recurrent_loops] += val_bpb
+            val_counts[base_model.num_recurrent_loops] += 1
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if train_loss_counts:
+                log0(f"loop_train_stats:{format_loop_train_stats()}")
+            log0(f"loop_val_stats:{format_loop_val_stats()}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1511,6 +1613,25 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scheduled_loops = scheduled_recurrent_loops(step, elapsed_ms)
+        active_recurrent_loops = sampled_recurrent_loops(scheduled_loops)
+        set_training_recurrent_loops(active_recurrent_loops)
+        should_log_loop_update = scheduled_loops != last_scheduled_recurrent_loops
+        should_log_loop_update = should_log_loop_update or (
+            args.recurrent_loop_sample
+            and args.train_log_every > 0
+            and (step <= 10 or step % args.train_log_every == 0)
+        )
+        if should_log_loop_update:
+            progress = recurrent_schedule_progress(step, elapsed_ms)
+            log0(
+                f"recurrent_loop_schedule_update step:{step}/{args.iterations} "
+                f"scheduled_recurrent_loops:{scheduled_loops} "
+                f"active_recurrent_loops:{active_recurrent_loops} "
+                f"progress:{progress:.4f}"
+            )
+        last_active_recurrent_loops = active_recurrent_loops
+        last_scheduled_recurrent_loops = scheduled_loops
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1523,6 +1644,8 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        train_loss_sums[active_recurrent_loops] += train_loss.item()
+        train_loss_counts[active_recurrent_loops] += 1
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1550,6 +1673,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            log0(f"loop_train_stats:{format_loop_train_stats()}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1570,6 +1694,7 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    set_eval_recurrent_loops()
     serialize_and_validate_roundtrip(
         args,
         code,
