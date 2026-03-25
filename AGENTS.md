@@ -32,3 +32,5 @@ Both training scripts implement a compact GPT-style model and include:
 - Treat top-level training scripts as baselines.
 - Look in `records/` for the strongest or most specialized approaches.
 - Ignore `main.py`; it is a placeholder and not part of the real workflow.
+- For remote experiments, keep a close eye on active runs and check them intermittently until they are resolved, even if the user stops replying.
+- Do not leave finished or `inspection_hold` pods unattended; once artifacts are safely local, shut the pod down promptly to avoid wasting money.
