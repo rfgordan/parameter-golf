@@ -89,6 +89,7 @@ class Hyperparameters:
         num_recurrent_layers = 3
         num_decoder_layers = 3
     num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
+    consistency_loss_weight = float(os.environ.get("CONSISTENCY_LOSS_WEIGHT", 0.1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -1030,6 +1031,7 @@ class GPT(nn.Module):
         num_recurrent_mid_layers: int,
         num_decoder_layers: int,
         num_recurrent_loops: int,
+        consistency_loss_weight: float,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -1055,6 +1057,7 @@ class GPT(nn.Module):
         self.num_recurrent_mid_layers = num_recurrent_mid_layers
         self.num_decoder_layers = num_decoder_layers
         self.num_recurrent_loops = num_recurrent_loops
+        self.consistency_loss_weight = consistency_loss_weight
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.encoder_blocks = nn.ModuleList(
@@ -1115,7 +1118,7 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         logits, h0, h1 = self.forward_internal(input_ids)
         targets = target_ids.reshape(-1)
-        consistency_loss = F.mse_loss(h1.detach(), h0) * 0.1
+        consistency_loss = F.mse_loss(h1.detach(), h0) * self.consistency_loss_weight
         return F.cross_entropy(logits.float(), targets, reduction="mean") + consistency_loss
     
     def forward_internal(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -1271,6 +1274,7 @@ def main() -> None:
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
+        consistency_loss_weight=args.consistency_loss_weight,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
