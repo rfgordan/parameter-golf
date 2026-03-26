@@ -1,0 +1,96 @@
+{
+  "run_dir": "/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325",
+  "probe": {
+    "batch_size": 2,
+    "seq_len": 256,
+    "offset": 4096,
+    "device": "cpu"
+  },
+  "raw_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 25.05600357055664,
+      "cos_prev": 0.2945973575115204,
+      "cos_encoder": 0.2945973575115204,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.28853920102119446,
+      "cos_prev": 0.9795883893966675,
+      "cos_encoder": 0.28111928701400757,
+      "time_sensitivity_rel": 0.03667552024126053
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.22183288633823395,
+      "cos_prev": 0.987741231918335,
+      "cos_encoder": 0.26482677459716797,
+      "time_sensitivity_rel": 0.09128150343894958
+    },
+    {
+      "loop": 4.0,
+      "rel_update_norm": 0.19383364915847778,
+      "cos_prev": 0.9902975559234619,
+      "cos_encoder": 0.24732935428619385,
+      "time_sensitivity_rel": 0.15968389809131622
+    }
+  ],
+  "quant_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 24.89437484741211,
+      "cos_prev": 0.29449462890625,
+      "cos_encoder": 0.29449462890625,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.2897008955478668,
+      "cos_prev": 0.9794245362281799,
+      "cos_encoder": 0.28070884943008423,
+      "time_sensitivity_rel": 0.03714532405138016
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.22298620641231537,
+      "cos_prev": 0.9874856472015381,
+      "cos_encoder": 0.26392799615859985,
+      "time_sensitivity_rel": 0.09287094324827194
+    },
+    {
+      "loop": 4.0,
+      "rel_update_norm": 0.1954735815525055,
+      "cos_prev": 0.9900344610214233,
+      "cos_encoder": 0.24588032066822052,
+      "time_sensitivity_rel": 0.1617024540901184
+    }
+  ],
+  "raw_quant_summary": [
+    {
+      "loop": 0.0,
+      "raw_quant_rel_diff": 0.0472208708524704,
+      "raw_quant_cos": 0.9989537000656128
+    },
+    {
+      "loop": 1.0,
+      "raw_quant_rel_diff": 0.03909601643681526,
+      "raw_quant_cos": 0.9991912245750427
+    },
+    {
+      "loop": 2.0,
+      "raw_quant_rel_diff": 0.04260696470737457,
+      "raw_quant_cos": 0.999076247215271
+    },
+    {
+      "loop": 3.0,
+      "raw_quant_rel_diff": 0.04841960594058037,
+      "raw_quant_cos": 0.9988300800323486
+    },
+    {
+      "loop": 4.0,
+      "raw_quant_rel_diff": 0.05518509820103645,
+      "raw_quant_cos": 0.9985023736953735
+    }
+  ]
+}

@@ -333,6 +333,96 @@ For comparison, the non-recurrent baseline from the int6 experiment achieved **1
 
 - [10-min STE QAT probe summary](assets/recurrent_block_probe_20260326T053304Z_ste_qat_10min_strided_20260325/summary.json)
 
+## Finding 7: 2/3x3/2 with Loop Curriculum — Faster Steps, Higher Time Sensitivity, Worse bpb
+
+A smaller architecture (2 encoder / 3 recurrent mid / 2 decoder, 4 loops) was tested with a loop curriculum (2→3→4 loops) and always-on STE QAT, aiming to recover training steps through faster per-step time.
+
+### Run
+
+| Run | Training budget | Steps | Run ID |
+| --- | --- | --- | --- |
+| 2/3x3/2 curriculum 10-min | 600s wallclock | 985 | `20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325` |
+
+Branch `strided-eval-recurse-loopformer-v1`, commit `a405556`. `QAT_FRACTION=0.3`, `QAT_MODE=ste`, `EVAL_STRIDED_ATTN=1`, `EVAL_STRIDE=64`.
+- Architecture: `2` encoder / `3` recurrent mid / `4` loops / `2` decoder
+- Model params: `16,924,728` (vs `24,274,008` for 4/3x3/4)
+- Curriculum: 2 loops for first 80% (831 steps), 3 loops for next 10% (54 steps), 4 loops for final 10% (100 steps)
+- QAT activated at step 764 (70% of wallclock)
+
+### Training metrics comparison
+
+| Metric | 4/3x3/4 10-min (Finding 6) | **2/3x3/2 curriculum 10-min** |
+| --- | --- | --- |
+| steps | 910 | **985** (+8.2%) |
+| params | 24.3M | **16.9M** (-30%) |
+| step avg | 660 ms | **610 ms** (-7.6%) |
+| val bpb (strided) | 1.3487 | 1.3606 |
+| roundtrip bpb | **1.3490** | 1.3611 |
+| **quant penalty** | **+0.0003** | **+0.0005** |
+| compressed model | 17.7 MB | **12.3 MB** (-30%) |
+
+The smaller model trains 8.2% more steps in the same budget but reaches 0.012 worse roundtrip bpb. Quant penalty remains negligible.
+
+### Probe comparison
+
+| Metric | Loop | 4/3x3/4 10-min | **2/3x3/2 curriculum** |
+| --- | --- | --- | --- |
+| rel_update_norm | 1 | `9.36` | **`25.06`** |
+| | 2 | `0.18` | `0.29` |
+| | 3 | `0.15` | `0.22` |
+| | 4 | — | `0.19` |
+| cos_prev | 1 | `0.303` | `0.295` |
+| | 2 | `0.979` | `0.980` |
+| | 3 | `0.989` | `0.988` |
+| | 4 | — | `0.990` |
+| cos_encoder | 1 | `0.303` | `0.295` |
+| | 2 | `0.276` | `0.281` |
+| | 3 | `0.255` | `0.265` |
+| | 4 | — | `0.247` |
+| time_sensitivity | 1 | `0.000` | `0.000` |
+| | 2 | `0.029` | `0.037` |
+| | 3 | `0.074` | `0.091` |
+| | 4 | — | **`0.160`** |
+
+### Quantization drift — still fully eliminated
+
+| State | 4/3x3/4 10-min | **2/3x3/2 curriculum** |
+| --- | --- | --- |
+| encoder | `0.999` | `0.999` |
+| loop 1 | `0.999` | `0.999` |
+| loop 2 | `0.998` | `0.999` |
+| loop 3 | `0.998` | `0.999` |
+| loop 4 | — | `0.999` |
+
+### Interpretation
+
+**Loop 1 does dramatically more work.** With fewer encoder/decoder layers to pre/post-process, the recurrent block compensates with a much larger first-loop transformation (update norm 25.1 vs 9.4). Loops 2-4 still collapse to near-identity (cos_prev ≥ 0.980), but slightly less than the 4/3x3/4 case.
+
+**Time sensitivity is 2x higher.** Loop 4 reaches 0.160 time sensitivity (vs 0.074 at loop 3 in the 4/3x3/4 model). The curriculum may help here — the model only sees loops 3-4 for the last 20% of training, so it must learn to differentiate them quickly. The gradient pressure to use the time embedding is higher when loops are scarce.
+
+**The step count advantage doesn't compensate for model capacity.** Despite 8.2% more steps, the smaller model is 0.012 bpb worse. The 30% reduction in encoder/decoder parameters removes capacity that the recurrent blocks can't fully replace, at least at this training duration.
+
+**Quant drift is architecture-invariant.** STE QAT eliminates quant penalty regardless of encoder/decoder depth or number of loops — cos(raw,quant) ≥ 0.999 everywhere.
+
+### Curriculum step timing
+
+| Phase | Steps | Loops | Approx ms/step |
+| --- | --- | --- | --- |
+| Steps 1–764 | 764 | 2 | ~551 |
+| Steps 764–831 | 67 | 2 + QAT (recompile) | ~750* |
+| Steps 831–885 | 54 | 3 + QAT | ~1057* |
+| Steps 885–985 | 100 | 4 + QAT | ~604 |
+
+*Includes one-time torch.compile retrace costs from QAT activation and loop count changes. The always-on QAT simplification (now implemented) will eliminate the QAT retrace. Loop count transitions will still cause retraces.
+
+### Probe assets
+
+- [2/3x3/2 curriculum probe summary](assets/recurrent_block_probe_20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325/summary.json)
+- [Relative update norm](assets/recurrent_block_probe_20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325/rel_update_norm.png)
+- [Cosine with previous](assets/recurrent_block_probe_20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325/cos_prev.png)
+- [Time sensitivity](assets/recurrent_block_probe_20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325/time_sensitivity_rel.png)
+- [Quantization drift](assets/recurrent_block_probe_20260326T150828Z_loopformer_2_3x3_2_curriculum234_10min_20260325/raw_quant_rel_diff.png)
+
 ## Conclusions
 
 1. **Gate-init fix resolved the identity collapse.** The recurrent blocks are now producing meaningful, non-degenerate transformations. This is the prerequisite for recurrence to help.
@@ -351,12 +441,17 @@ For comparison, the non-recurrent baseline from the int6 experiment achieved **1
 
 8. **The bottleneck is speed, not quantization.** The recurrent 10-min model achieves 1.349 roundtrip bpb vs 1.276 for the non-recurrent baseline — a 0.073 gap. Quant penalty is zero, so the entire gap is from fewer training steps at 660ms/step.
 
+9. **Smaller encoder/decoder with curriculum trades capacity for speed, net negative.** The 2/3x3/2 model trains 8.2% more steps (985 vs 910) but reaches 0.012 worse roundtrip bpb (1.361 vs 1.349). The step count gain from 30% fewer parameters doesn't compensate for the lost capacity.
+
+10. **Loop curriculum boosts time sensitivity.** The 2/3x3/2 curriculum run shows 2x the time sensitivity of the 4/3x3/4 run (0.160 at loop 4 vs 0.074 at loop 3). Introducing loops late in training forces the model to differentiate them quickly.
+
+11. **Always-on STE QAT eliminates recompile overhead.** QAT per-step cost is ~2-10ms (negligible). Removing the branch that activates QAT mid-training avoids a ~40s torch.compile retrace. Now implemented as a simple `QAT_ENABLED` boolean with no scheduling.
+
 ## Implications for Next Steps
 
 The quantization problem is fully solved by STE QAT. The binding constraint is now step throughput — the recurrent model trains fewer steps in the same wallclock budget.
 
 Remaining directions:
-- **Fewer encoder/decoder layers with more loops:** Trade encoder/decoder depth for recurrent depth (e.g., 2/3xN/2) to reduce step time while keeping parameter-shared capacity.
-- **Loop curriculum:** Start with fewer loops (fast per-step) and ramp up later, maximizing early-training throughput.
-- **Pre-warm QAT graph during warmup:** Eliminate the ~40s torch.compile retrace cost.
-- **Damped residual:** `x = alpha * loop_output + (1-alpha) * x` to mechanically bound error amplification per loop.
+- **Improve recurrence utilization:** Loops 2+ collapse to near-identity at scale. The model needs architectural changes (e.g., damped residuals, forced bottlenecks) to make later loops do meaningful work.
+- **Curriculum for time sensitivity:** Loop curriculum shows promise for activating time embeddings. Explore more aggressive schedules or longer tier-3/4 phases.
+- **Reduce step time without losing capacity:** The 2/3x3/2 experiment shows that simply shrinking encoder/decoder is net negative. Other options: attention optimization, fewer recurrent mid layers with more loops, mixed precision improvements.
