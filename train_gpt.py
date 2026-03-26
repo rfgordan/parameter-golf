@@ -61,6 +61,8 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     init_model_path = os.environ.get("INIT_MODEL_PATH", "")
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_fraction = float(os.environ.get("QAT_FRACTION", 1.0))
     
     # Strided Attn Params
     eval_strided_attn = bool(int(os.environ.get("EVAL_STRIDED_ATTN", "0")))
@@ -526,13 +528,6 @@ USE_INT6 = bool(int(os.environ.get("USE_INT6", "0")))
 INT8_QUANT_RANGE = 127
 INT6_QUANT_RANGE = 31
 
-# --------------- Noisy QAT ---------------
-# During the late phase of training, inject uniform noise matched to int8 per-row
-# quantization step size into CastedLinear weights. This teaches the model to be
-# robust to the quantization error it will see at export time, without constraining
-# loop expressiveness the way shortcut consistency does.
-QAT_ENABLED = bool(int(os.environ.get("QAT_ENABLED", "0")))
-
 def _ste_fake_quantize(w: Tensor) -> Tensor:
     """STE fake-quantize matching the int8/int6 export format exactly.
 
@@ -849,10 +844,15 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("qat_strength", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.training and QAT_ENABLED and w.ndim == 2:
-            w = _ste_fake_quantize(w)
+        if self.training and w.ndim == 2:
+            qat_strength = self.qat_strength.to(device=w.device, dtype=w.dtype)
+            w = torch.lerp(w, _ste_fake_quantize(w), qat_strength)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -863,6 +863,13 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def set_qat_strength(module: nn.Module, strength: float) -> None:
+    with torch.no_grad():
+        for submodule in module.modules():
+            if isinstance(submodule, CastedLinear):
+                submodule.qat_strength.fill_(strength)
 
 
 class Rotary(nn.Module):
@@ -1317,6 +1324,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    set_qat_strength(base_model, 0.0)
     if args.eval_only and not args.init_model_path:
         raise ValueError("EVAL_ONLY=1 requires INIT_MODEL_PATH")
     if args.init_model_path and not args.eval_only:
@@ -1504,6 +1512,16 @@ def main() -> None:
             return min(max(elapsed_ms / max(max_wallclock_ms or 1.0, 1e-9), 0.0), 1.0)
         return min(max(step_idx / max(args.iterations, 1), 0.0), 1.0)
 
+    def qat_progress(step_idx: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None:
+            return min(max(elapsed_ms / max(max_wallclock_ms, 1e-9), 0.0), 1.0)
+        return min(max(step_idx / max(args.iterations, 1), 0.0), 1.0)
+
+    def scheduled_qat_strength(step_idx: int, elapsed_ms: float) -> float:
+        if not args.qat_enabled or args.qat_fraction <= 0.0:
+            return 0.0
+        return 1.0 if qat_progress(step_idx, elapsed_ms) >= 1.0 - args.qat_fraction else 0.0
+
     # Parse the loop schedule tiers: comma-separated loop counts matching the fractions.
     # Default "1,2" means: first_frac → 1 loop, second_frac → 2 loops, remainder → all.
     schedule_tiers_str = os.environ.get("RECURRENT_LOOP_SCHEDULE_TIERS", "1,2")
@@ -1607,6 +1625,7 @@ def main() -> None:
     step = 0
     last_active_recurrent_loops: int | None = None
     last_scheduled_recurrent_loops: int | None = None
+    last_qat_strength: float | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1649,6 +1668,11 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        qat_strength = scheduled_qat_strength(step, elapsed_ms)
+        set_qat_strength(base_model, qat_strength)
+        if qat_strength != last_qat_strength:
+            log0(f"qat_schedule_update step:{step}/{args.iterations} qat_strength:{qat_strength:.2f}")
+            last_qat_strength = qat_strength
         scheduled_loops = scheduled_recurrent_loops(step, elapsed_ms)
         active_recurrent_loops = sampled_recurrent_loops(scheduled_loops)
         set_training_recurrent_loops(active_recurrent_loops)

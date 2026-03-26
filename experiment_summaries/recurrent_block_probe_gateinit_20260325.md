@@ -445,7 +445,7 @@ The smaller model trains 8.2% more steps in the same budget but reaches 0.012 wo
 
 10. **Loop curriculum boosts time sensitivity.** The 2/3x3/2 curriculum run shows 2x the time sensitivity of the 4/3x3/4 run (0.160 at loop 4 vs 0.074 at loop 3). Introducing loops late in training forces the model to differentiate them quickly.
 
-11. **Always-on STE QAT eliminates recompile overhead.** QAT per-step cost is ~2-10ms (negligible). Removing the branch that activates QAT mid-training avoids a ~40s torch.compile retrace. Now implemented as a simple `QAT_ENABLED` boolean with no scheduling.
+11. **Scalar-scheduled STE QAT avoids the recompile.** QAT per-step cost is ~2-10ms (negligible). Instead of flipping a boolean branch mid-training, the code now keeps one compiled path and drives a per-module `qat_strength` scalar from `0` to `1` late in training, so late QAT can be used without a `torch.compile` retrace.
 
 ## Implications for Next Steps
 
