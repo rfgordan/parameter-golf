@@ -90,7 +90,7 @@ class Hyperparameters:
         num_recurrent_layers = 3
         num_decoder_layers = 3
     num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
-    shortcut_consistency_weight = float(os.environ.get("SHORTCUT_CONSISTENCY_WEIGHT", 0.0))
+    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.0))
     recurrent_loop_schedule = bool(int(os.environ.get("RECURRENT_LOOP_SCHEDULE", "0")))
     recurrent_loop_schedule_mode = os.environ.get("RECURRENT_LOOP_SCHEDULE_MODE", "auto")
     recurrent_loop_schedule_first_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_FIRST_FRAC", 0.5))
@@ -527,6 +527,30 @@ USE_INT6 = bool(int(os.environ.get("USE_INT6", "0")))
 INT8_QUANT_RANGE = 127
 INT6_QUANT_RANGE = 31
 
+# --------------- Noisy QAT ---------------
+# During the late phase of training, inject uniform noise matched to int8 per-row
+# quantization step size into CastedLinear weights. This teaches the model to be
+# robust to the quantization error it will see at export time, without constraining
+# loop expressiveness the way shortcut consistency does.
+_QAT_ACTIVE = False
+
+def _noisy_qat_int8(w: Tensor) -> Tensor:
+    """Add uniform noise calibrated to per-row int8 quantization step size.
+
+    Unlike STE fake-quantize (round then straight-through), this injects
+    differentiable noise whose magnitude matches the export format's error
+    distribution. Gradients flow naturally through the noise addition.
+    """
+    quant_range = float(INT6_QUANT_RANGE if USE_INT6 else INT8_QUANT_RANGE)
+    with torch.no_grad():
+        # Per-row amax scale — simpler/faster than quantile and torch.compile safe.
+        amax = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+        step_size = amax / quant_range
+    # Uniform noise in [-0.5*step, +0.5*step] per row — matches expected
+    # rounding error distribution of nearest-int quantization.
+    noise = (torch.rand_like(w) - 0.5) * step_size
+    return w + noise
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -829,8 +853,11 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if self.training and _QAT_ACTIVE and w.ndim == 2:
+            w = _noisy_qat_int8(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1041,7 +1068,6 @@ class GPT(nn.Module):
         num_recurrent_mid_layers: int,
         num_decoder_layers: int,
         num_recurrent_loops: int,
-        shortcut_consistency_weight: float,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -1068,7 +1094,6 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.num_recurrent_loops = num_recurrent_loops
         self.active_recurrent_loops = num_recurrent_loops
-        self.shortcut_consistency_weight = shortcut_consistency_weight
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.encoder_blocks = nn.ModuleList(
@@ -1146,45 +1171,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         targets = target_ids.reshape(-1)
-        if self.training and self.shortcut_consistency_weight > 0 and self.active_recurrent_loops > 1:
-            logits, shortcut_logits = self._forward_with_shortcut(input_ids)
-            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-            shortcut_loss = F.cross_entropy(shortcut_logits.float(), targets, reduction="mean")
-            return main_loss + self.shortcut_consistency_weight * shortcut_loss
         logits = self.forward_internal(input_ids)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
-
-    def _forward_with_shortcut(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.encoder_blocks[i](x, x0)
-            skips.append(x)
-
-        # Pick a random shortcut depth in [1, active_recurrent_loops).
-        # Use one_hot mask to capture the state without graph-breaking branches.
-        shortcut_idx = torch.randint(1, self.active_recurrent_loops, (), device=x.device)
-        shortcut_mask = F.one_hot(shortcut_idx, self.active_recurrent_loops).to(dtype=x.dtype)
-        shortcut_state = torch.zeros_like(x)
-
-        for i in range(self.active_recurrent_loops):
-            ti = torch.full(
-                (x.size(0), 1),
-                i / self.num_recurrent_loops,
-                dtype=torch.bfloat16,
-                device=x.device,
-            )
-            for j in range(self.num_recurrent_mid_layers):
-                c = self.time_embedder(ti)
-                x = self.recurrent_blocks[j](x, c)
-            shortcut_state = shortcut_state + shortcut_mask[i] * (x - shortcut_state)
-
-        logits = self._decode(x, x0, skips)
-        shortcut_logits = self._decode(shortcut_state, x0, skips)
-        return logits, shortcut_logits
 
     def forward_internal(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1317,7 +1305,6 @@ def main() -> None:
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
-        shortcut_consistency_weight=args.shortcut_consistency_weight,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1679,6 +1666,29 @@ def main() -> None:
             )
         last_active_recurrent_loops = active_recurrent_loops
         last_scheduled_recurrent_loops = scheduled_loops
+
+        # Late QAT: activate noisy quantization in the last qat_fraction of training.
+        global _QAT_ACTIVE
+        if args.qat_fraction > 0 and max_wallclock_ms is not None:
+            qat_start_ms = max_wallclock_ms * (1.0 - args.qat_fraction)
+            should_be_active = elapsed_ms >= qat_start_ms
+            if should_be_active and not _QAT_ACTIVE:
+                _QAT_ACTIVE = True
+                log0(
+                    f"qat_activated step:{step}/{args.iterations} "
+                    f"elapsed_ms:{elapsed_ms:.0f} qat_start_ms:{qat_start_ms:.0f}"
+                )
+        elif args.qat_fraction > 0 and max_wallclock_ms is None:
+            # Fallback: step-based schedule when no wallclock cap.
+            qat_start_step = int(args.iterations * (1.0 - args.qat_fraction))
+            should_be_active = step >= qat_start_step
+            if should_be_active and not _QAT_ACTIVE:
+                _QAT_ACTIVE = True
+                log0(
+                    f"qat_activated step:{step}/{args.iterations} "
+                    f"qat_start_step:{qat_start_step}"
+                )
+
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1741,6 +1751,7 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    _QAT_ACTIVE = False  # noqa: F841 — Ensure clean weights for serialization.
     set_eval_recurrent_loops()
     serialize_and_validate_roundtrip(
         args,
