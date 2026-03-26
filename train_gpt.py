@@ -532,14 +532,16 @@ INT6_QUANT_RANGE = 31
 # quantization step size into CastedLinear weights. This teaches the model to be
 # robust to the quantization error it will see at export time, without constraining
 # loop expressiveness the way shortcut consistency does.
-_QAT_ACTIVE = False
+_QAT_SCALE = 0.0  # 0.0 = off, 1.0 = on. Float avoids torch.compile graph breaks.
+QAT_MODE = os.environ.get("QAT_MODE", "noise")  # "noise" or "ste"
 
-def _noisy_qat_int8(w: Tensor) -> Tensor:
+def _noisy_qat_int8(w: Tensor, scale: float) -> Tensor:
     """Add uniform noise calibrated to per-row int8 quantization step size.
 
     Unlike STE fake-quantize (round then straight-through), this injects
     differentiable noise whose magnitude matches the export format's error
     distribution. Gradients flow naturally through the noise addition.
+    `scale` is 0.0 (no noise) or 1.0 (full noise) — avoids graph breaks.
     """
     quant_range = float(INT6_QUANT_RANGE if USE_INT6 else INT8_QUANT_RANGE)
     with torch.no_grad():
@@ -548,8 +550,22 @@ def _noisy_qat_int8(w: Tensor) -> Tensor:
         step_size = amax / quant_range
     # Uniform noise in [-0.5*step, +0.5*step] per row — matches expected
     # rounding error distribution of nearest-int quantization.
-    noise = (torch.rand_like(w) - 0.5) * step_size
+    noise = scale * (torch.rand_like(w) - 0.5) * step_size
     return w + noise
+
+def _ste_fake_quantize(w: Tensor) -> Tensor:
+    """STE fake-quantize matching the int8/int6 export format exactly.
+
+    Forward sees quantized weights, backward flows through the original.
+    Per-row symmetric quantization with amax scaling (no clipping percentile).
+    """
+    quant_range = float(INT6_QUANT_RANGE if USE_INT6 else INT8_QUANT_RANGE)
+    with torch.no_grad():
+        w32 = w.float()
+        row_max = w32.abs().amax(dim=1)
+        scale = (row_max / quant_range).clamp_min(1.0 / quant_range)
+        w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -quant_range - 1, quant_range) * scale[:, None]).to(w.dtype)
+    return w + (w_q - w).detach()  # STE: forward=quantized, backward=original
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -854,8 +870,8 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.training and _QAT_ACTIVE and w.ndim == 2:
-            w = _noisy_qat_int8(w)
+        if self.training and w.ndim == 2 and _QAT_SCALE > 0.0:
+            w = _ste_fake_quantize(w) if QAT_MODE == "ste" else _noisy_qat_int8(w, _QAT_SCALE)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -1668,12 +1684,12 @@ def main() -> None:
         last_scheduled_recurrent_loops = scheduled_loops
 
         # Late QAT: activate noisy quantization in the last qat_fraction of training.
-        global _QAT_ACTIVE
+        global _QAT_SCALE
         if args.qat_fraction > 0 and max_wallclock_ms is not None:
             qat_start_ms = max_wallclock_ms * (1.0 - args.qat_fraction)
             should_be_active = elapsed_ms >= qat_start_ms
-            if should_be_active and not _QAT_ACTIVE:
-                _QAT_ACTIVE = True
+            if should_be_active and _QAT_SCALE == 0.0:
+                _QAT_SCALE = 1.0
                 log0(
                     f"qat_activated step:{step}/{args.iterations} "
                     f"elapsed_ms:{elapsed_ms:.0f} qat_start_ms:{qat_start_ms:.0f}"
@@ -1682,8 +1698,8 @@ def main() -> None:
             # Fallback: step-based schedule when no wallclock cap.
             qat_start_step = int(args.iterations * (1.0 - args.qat_fraction))
             should_be_active = step >= qat_start_step
-            if should_be_active and not _QAT_ACTIVE:
-                _QAT_ACTIVE = True
+            if should_be_active and _QAT_SCALE == 0.0:
+                _QAT_SCALE = 1.0
                 log0(
                     f"qat_activated step:{step}/{args.iterations} "
                     f"qat_start_step:{qat_start_step}"
