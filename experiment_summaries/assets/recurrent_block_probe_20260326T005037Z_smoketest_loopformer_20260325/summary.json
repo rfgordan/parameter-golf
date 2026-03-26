@@ -1,0 +1,77 @@
+{
+  "run_dir": "/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260326T005037Z_smoketest_loopformer_20260325",
+  "probe": {
+    "batch_size": 2,
+    "seq_len": 256,
+    "offset": 4096,
+    "device": "cpu"
+  },
+  "raw_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 8.839505195617676,
+      "cos_prev": 0.32348304986953735,
+      "cos_encoder": 0.32348304986953735,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.2509111762046814,
+      "cos_prev": 0.986771285533905,
+      "cos_encoder": 0.30744022130966187,
+      "time_sensitivity_rel": 0.013678323477506638
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.18890324234962463,
+      "cos_prev": 0.9936374425888062,
+      "cos_encoder": 0.2938902974128723,
+      "time_sensitivity_rel": 0.033831894397735596
+    }
+  ],
+  "quant_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 8.677656173706055,
+      "cos_prev": 0.3255976736545563,
+      "cos_encoder": 0.3255976736545563,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.2523156702518463,
+      "cos_prev": 0.9867074489593506,
+      "cos_encoder": 0.30934637784957886,
+      "time_sensitivity_rel": 0.01392863318324089
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.1888592541217804,
+      "cos_prev": 0.9936779737472534,
+      "cos_encoder": 0.2957790195941925,
+      "time_sensitivity_rel": 0.03471788763999939
+    }
+  ],
+  "raw_quant_summary": [
+    {
+      "loop": 0.0,
+      "raw_quant_rel_diff": 0.05160067230463028,
+      "raw_quant_cos": 0.9986361265182495
+    },
+    {
+      "loop": 1.0,
+      "raw_quant_rel_diff": 0.09299913048744202,
+      "raw_quant_cos": 0.9956985712051392
+    },
+    {
+      "loop": 2.0,
+      "raw_quant_rel_diff": 0.09272696822881699,
+      "raw_quant_cos": 0.9956533908843994
+    },
+    {
+      "loop": 3.0,
+      "raw_quant_rel_diff": 0.09495215862989426,
+      "raw_quant_cos": 0.9953892230987549
+    }
+  ]
+}

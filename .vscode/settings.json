@@ -1,5 +1,8 @@
 {
   "github.copilot.enable": {
     "*": false
+  },
+  "workbench.editorAssociations": {
+    "*.md": "vscode.markdown.preview.editor"
   }
 }
