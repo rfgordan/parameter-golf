@@ -90,7 +90,6 @@ class Hyperparameters:
         num_recurrent_layers = 3
         num_decoder_layers = 3
     num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
-    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.0))
     recurrent_loop_schedule = bool(int(os.environ.get("RECURRENT_LOOP_SCHEDULE", "0")))
     recurrent_loop_schedule_mode = os.environ.get("RECURRENT_LOOP_SCHEDULE_MODE", "auto")
     recurrent_loop_schedule_first_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_FIRST_FRAC", 0.5))
@@ -532,32 +531,14 @@ INT6_QUANT_RANGE = 31
 # quantization step size into CastedLinear weights. This teaches the model to be
 # robust to the quantization error it will see at export time, without constraining
 # loop expressiveness the way shortcut consistency does.
-_QAT_SCALE = 0.0  # 0.0 = off, 1.0 = on. Float avoids torch.compile graph breaks.
-QAT_MODE = os.environ.get("QAT_MODE", "noise")  # "noise" or "ste"
-
-def _noisy_qat_int8(w: Tensor, scale: float) -> Tensor:
-    """Add uniform noise calibrated to per-row int8 quantization step size.
-
-    Unlike STE fake-quantize (round then straight-through), this injects
-    differentiable noise whose magnitude matches the export format's error
-    distribution. Gradients flow naturally through the noise addition.
-    `scale` is 0.0 (no noise) or 1.0 (full noise) — avoids graph breaks.
-    """
-    quant_range = float(INT6_QUANT_RANGE if USE_INT6 else INT8_QUANT_RANGE)
-    with torch.no_grad():
-        # Per-row amax scale — simpler/faster than quantile and torch.compile safe.
-        amax = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-        step_size = amax / quant_range
-    # Uniform noise in [-0.5*step, +0.5*step] per row — matches expected
-    # rounding error distribution of nearest-int quantization.
-    noise = scale * (torch.rand_like(w) - 0.5) * step_size
-    return w + noise
+QAT_ENABLED = bool(int(os.environ.get("QAT_ENABLED", "0")))
 
 def _ste_fake_quantize(w: Tensor) -> Tensor:
     """STE fake-quantize matching the int8/int6 export format exactly.
 
     Forward sees quantized weights, backward flows through the original.
     Per-row symmetric quantization with amax scaling (no clipping percentile).
+    Negligible per-step overhead (~2-10ms), so always-on when enabled.
     """
     quant_range = float(INT6_QUANT_RANGE if USE_INT6 else INT8_QUANT_RANGE)
     with torch.no_grad():
@@ -870,8 +851,8 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.training and w.ndim == 2 and _QAT_SCALE > 0.0:
-            w = _ste_fake_quantize(w) if QAT_MODE == "ste" else _noisy_qat_int8(w, _QAT_SCALE)
+        if self.training and QAT_ENABLED and w.ndim == 2:
+            w = _ste_fake_quantize(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -1221,7 +1202,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5, _QAT_SCALE
+    global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -1418,7 +1399,7 @@ def main() -> None:
             f"fractions=({args.recurrent_loop_schedule_first_frac:.2f},"
             f"{args.recurrent_loop_schedule_second_frac:.2f},"
             f"{1.0 - args.recurrent_loop_schedule_first_frac - args.recurrent_loop_schedule_second_frac:.2f}) "
-            f"loops=(1,{min(2, args.num_recurrent_loops)},{args.num_recurrent_loops})"
+            f"loops=({os.environ.get('RECURRENT_LOOP_SCHEDULE_TIERS', '1,2')},{args.num_recurrent_loops})"
         )
     if args.recurrent_loop_sample:
         log0(f"recurrent_loop_sample:choices={args.recurrent_loop_sample_choices}")
@@ -1606,19 +1587,6 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        # Pre-warm the QAT code path so torch.compile traces it now, not mid-training.
-        # Without this, flipping _QAT_SCALE triggers a ~40s retrace during the run.
-        if args.qat_fraction > 0:
-            _QAT_SCALE = 1.0
-            zero_grad_all()
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                qat_warmup_loss = model(x, y)
-            (qat_warmup_loss * grad_scale).backward()
-            zero_grad_all()
-            _QAT_SCALE = 0.0
-            log0("warmup_qat_path_prewarmed")
-
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1701,27 +1669,6 @@ def main() -> None:
         last_active_recurrent_loops = active_recurrent_loops
         last_scheduled_recurrent_loops = scheduled_loops
 
-        # Late QAT: activate noisy quantization in the last qat_fraction of training.
-        # (global _QAT_SCALE declared in warmup block above)
-        if args.qat_fraction > 0 and max_wallclock_ms is not None:
-            qat_start_ms = max_wallclock_ms * (1.0 - args.qat_fraction)
-            should_be_active = elapsed_ms >= qat_start_ms
-            if should_be_active and _QAT_SCALE == 0.0:
-                _QAT_SCALE = 1.0
-                log0(
-                    f"qat_activated step:{step}/{args.iterations} "
-                    f"elapsed_ms:{elapsed_ms:.0f} qat_start_ms:{qat_start_ms:.0f}"
-                )
-        elif args.qat_fraction > 0 and max_wallclock_ms is None:
-            # Fallback: step-based schedule when no wallclock cap.
-            qat_start_step = int(args.iterations * (1.0 - args.qat_fraction))
-            should_be_active = step >= qat_start_step
-            if should_be_active and _QAT_SCALE == 0.0:
-                _QAT_SCALE = 1.0
-                log0(
-                    f"qat_activated step:{step}/{args.iterations} "
-                    f"qat_start_step:{qat_start_step}"
-                )
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -1785,7 +1732,6 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-    _QAT_SCALE = 0.0  # Ensure clean weights for serialization.
     set_eval_recurrent_loops()
     serialize_and_validate_roundtrip(
         args,
