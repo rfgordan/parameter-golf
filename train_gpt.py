@@ -1523,14 +1523,19 @@ def main() -> None:
             return min(max(elapsed_ms / max(max_wallclock_ms or 1.0, 1e-9), 0.0), 1.0)
         return min(max(step_idx / max(args.iterations, 1), 0.0), 1.0)
 
+    # Parse the loop schedule tiers: comma-separated loop counts matching the fractions.
+    # Default "1,2" means: first_frac → 1 loop, second_frac → 2 loops, remainder → all.
+    schedule_tiers_str = os.environ.get("RECURRENT_LOOP_SCHEDULE_TIERS", "1,2")
+    schedule_tiers = [int(x.strip()) for x in schedule_tiers_str.split(",") if x.strip()]
+
     def scheduled_recurrent_loops(step_idx: int, elapsed_ms: float) -> int:
         if not args.recurrent_loop_schedule:
             return base_model.num_recurrent_loops
         progress = recurrent_schedule_progress(step_idx, elapsed_ms)
         if progress < args.recurrent_loop_schedule_first_frac:
-            return 1
-        if progress < args.recurrent_loop_schedule_first_frac + args.recurrent_loop_schedule_second_frac:
-            return min(2, base_model.num_recurrent_loops)
+            return min(schedule_tiers[0], base_model.num_recurrent_loops)
+        if len(schedule_tiers) > 1 and progress < args.recurrent_loop_schedule_first_frac + args.recurrent_loop_schedule_second_frac:
+            return min(schedule_tiers[1], base_model.num_recurrent_loops)
         return base_model.num_recurrent_loops
 
     def sampled_recurrent_loops(max_active_loops: int) -> int:
@@ -1601,6 +1606,20 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        # Pre-warm the QAT code path so torch.compile traces it now, not mid-training.
+        # Without this, flipping _QAT_SCALE triggers a ~40s retrace during the run.
+        if args.qat_fraction > 0:
+            global _QAT_SCALE
+            _QAT_SCALE = 1.0
+            zero_grad_all()
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                qat_warmup_loss = model(x, y)
+            (qat_warmup_loss * grad_scale).backward()
+            zero_grad_all()
+            _QAT_SCALE = 0.0
+            log0("warmup_qat_path_prewarmed")
+
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)

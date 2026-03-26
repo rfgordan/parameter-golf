@@ -129,6 +129,210 @@ Plots (2-min run):
 - [Time sensitivity](assets/recurrent_block_probe_20260326T012005Z_smoketest_loopformer_2min_20260325/time_sensitivity_rel.png)
 - [Quantization drift](assets/recurrent_block_probe_20260326T012005Z_smoketest_loopformer_2min_20260325/raw_quant_rel_diff.png)
 
+## Finding 4: Shortcut Consistency Loss — Improves Quant Robustness but Reduces Loop Differentiation
+
+A shortcut consistency loss was added (weight=0.1): during training, the recurrence is randomly truncated at a uniformly sampled depth and the intermediate state is decoded through the shared decoder head with an auxiliary CE loss. This encourages each intermediate recurrent state to be independently useful for prediction.
+
+### Run
+
+| Run | Training budget | Steps completed | Run ID |
+| --- | --- | --- | --- |
+| Shortcut 3-min | 180s wallclock | 235 | `20260326T022417Z_shortcut_consistency_3min_20260325` |
+
+Same architecture (`4/3x3/4`), same branch, commit `41a81087`. `SHORTCUT_CONSISTENCY_WEIGHT=0.1`, `USE_INT6=0`.
+
+Raw results: [shortcut consistency 3-min results](../.runpod/results/20260326T022417Z_shortcut_consistency_3min_20260325)
+
+### Training metrics comparison (baseline 2-min vs shortcut 3-min)
+
+| Metric | Baseline 2-min (186 steps) | Shortcut 3-min (235 steps) |
+| --- | --- | --- |
+| last train loss | `3.399` | `3.349` |
+| final val bpb | `1.958` | `1.785` |
+| int8 roundtrip val bpb | `2.267` | `1.971` |
+| **quantization penalty (bpb)** | **`+0.309`** | **`+0.186`** |
+| int8+zlib model bytes | `10,637,311` | `11,424,384` |
+| step avg | `~645 ms` | `~767 ms` |
+
+The shortcut run trained longer (235 vs 186 steps) due to 3-min budget, so raw bpb is better. The key comparison is the quant penalty: **+0.186 vs +0.309**, a 40% reduction. Step time is ~19% slower due to the extra decoder forward pass.
+
+### Probe comparison: recurrent dynamics
+
+| Metric | Loop | Baseline 2-min | Shortcut 3-min | Direction |
+| --- | --- | --- | --- | --- |
+| rel_update_norm | 1 | `4.72` | `5.78` | higher (more active) |
+| | 2 | `0.95` | `0.83` | lower |
+| | 3 | `0.49` | `0.45` | lower |
+| cos_prev | 1 | `0.243` | `0.232` | ≈same |
+| | 2 | `0.869` | **`0.890`** | higher (less differentiated) |
+| | 3 | `0.966` | **`0.971`** | higher (less differentiated) |
+| cos_encoder | 1 | `0.243` | `0.232` | ≈same |
+| | 2 | `0.108` | `0.149` | higher (closer to encoder) |
+| | 3 | `0.046` | **`0.110`** | higher (closer to encoder) |
+| time_sensitivity | 1 | `0.000` | `0.000` | same |
+| | 2 | `0.016` | `0.020` | slightly higher |
+| | 3 | `0.035` | `0.041` | slightly higher |
+
+### Quantization drift comparison
+
+| State | Baseline cos(raw,quant) | Shortcut cos(raw,quant) | Improvement |
+| --- | --- | --- | --- |
+| encoder (loop 0) | `0.998` | `0.998` | — |
+| after loop 1 | `0.827` | **`0.894`** | +0.067 |
+| after loop 2 | `0.783` | **`0.866`** | +0.083 |
+| after loop 3 | `0.741` | **`0.835`** | +0.094 |
+
+| State | Baseline rel_diff | Shortcut rel_diff | Improvement |
+| --- | --- | --- | --- |
+| encoder (loop 0) | `0.067` | `0.069` | — |
+| after loop 1 | `0.583` | **`0.456`** | -0.127 |
+| after loop 2 | `0.651` | **`0.514`** | -0.137 |
+| after loop 3 | `0.717` | **`0.573`** | -0.144 |
+
+### Interpretation
+
+Shortcut consistency achieves its goal of improving quantization robustness — the quantized state stays substantially closer to the raw state at every loop depth. However, it comes with a trade-off:
+
+**The loops become less differentiated.** cos_prev increases at loops 2–3, and cos_encoder increases at loop 3 (from 0.046 → 0.110), meaning the later loops are doing less novel transformation and staying closer to earlier states. This is the expected consequence of requiring each intermediate state to decode well independently — the model can't afford to move far from a decodable representation at any step.
+
+This creates a tension: the loss improves quant robustness by constraining the representation to a decoder-friendly subspace, but that same constraint limits how much the recurrence can transform the representation, potentially capping the expressiveness benefit of multiple loops.
+
+### Probe assets
+
+- [Shortcut 3-min probe summary](assets/recurrent_block_probe_20260326T022417Z_shortcut_consistency_3min_20260325/summary.json)
+- [Quantization drift](assets/recurrent_block_probe_20260326T022417Z_shortcut_consistency_3min_20260325/raw_quant_rel_diff.png)
+- [Cosine with previous](assets/recurrent_block_probe_20260326T022417Z_shortcut_consistency_3min_20260325/cos_prev.png)
+
+## Finding 5: Late QAT — Near-Zero Quant Penalty, Same Loop Dynamics Trade-off
+
+Two QAT variants were tested, both activated in the last 30% of training (`QAT_FRACTION=0.3`, wallclock-based):
+- **Noise QAT** (`QAT_MODE=noise`): Injects uniform noise calibrated to per-row int8 step size. Gradients flow naturally.
+- **STE QAT** (`QAT_MODE=ste`): Straight-through estimator fake-quantize matching the exact export format (round, clamp, dequant per row).
+
+### Runs
+
+| Run | QAT mode | Steps | QAT activated at | Run ID |
+| --- | --- | --- | --- | --- |
+| Noise 3-min | noise | 214 | step 193 (126.6s) | `20260326T043602Z_noisy_qat_3min_20260325` |
+| STE 3-min | ste | 212 | step 193 (126.2s) | `20260326T050543Z_ste_qat_3min_20260325` |
+
+Same architecture (`4/3x3/4`), same branch, commit `ca4e2fd`. `QAT_FRACTION=0.3`, `USE_INT6=0`.
+
+### Training metrics comparison
+
+| Metric | Baseline 2-min | Shortcut 3-min | Noise QAT 3-min | STE QAT 3-min |
+| --- | --- | --- | --- | --- |
+| steps | 186 | 235 | 214 | 212 |
+| val bpb | 1.958 | 1.785 | 1.749 | 1.772 |
+| roundtrip bpb | 2.267 | 1.971 | 1.836 | **1.780** |
+| **quant penalty** | **+0.309** | **+0.186** | **+0.087** | **+0.009** |
+| step avg (pre-QAT) | 645 ms | 767 ms | 657 ms | 654 ms |
+
+STE QAT achieves near-zero quant penalty (+0.009 bpb). Noise QAT gets +0.087 — much better than baseline/shortcut but worse than STE because uniform noise only approximates the rounding behavior.
+
+**Performance note**: QAT triggers a one-time `torch.compile` retrace (~40s) when the branch flips. Post-recompile per-step time is identical to pre-QAT (~655ms). The retrace cost is 22% of a 3-min budget but only 6.7% of a 10-min run. This can be eliminated by pre-warming both code paths during the existing warmup phase.
+
+### Probe comparison: recurrent dynamics
+
+| Metric | Loop | Baseline | Shortcut | Noise QAT | STE QAT |
+| --- | --- | --- | --- | --- | --- |
+| rel_update_norm | 1 | `4.72` | `5.78` | `5.97` | `5.79` |
+| | 2 | `0.95` | `0.83` | `0.78` | `0.78` |
+| | 3 | `0.49` | `0.45` | `0.44` | `0.44` |
+| cos_prev | 1 | `0.243` | `0.232` | `0.294` | `0.308` |
+| | 2 | `0.869` | `0.890` | `0.907` | `0.908` |
+| | 3 | `0.966` | `0.971` | `0.972` | `0.973` |
+| cos_encoder | 1 | `0.243` | `0.232` | `0.294` | `0.308` |
+| | 2 | `0.108` | `0.149` | `0.207` | `0.217` |
+| | 3 | `0.046` | `0.110` | `0.158` | `0.165` |
+
+### Quantization drift comparison
+
+| State | Baseline | Shortcut | Noise QAT | STE QAT |
+| --- | --- | --- | --- | --- |
+| encoder (loop 0) | `0.998` | `0.998` | `0.998` | `0.998` |
+| after loop 1 | `0.827` | `0.894` | **`0.941`** | **`0.945`** |
+| after loop 2 | `0.783` | `0.866` | **`0.926`** | **`0.932`** |
+| after loop 3 | `0.741` | `0.835` | **`0.909`** | **`0.916`** |
+
+### Interpretation
+
+Both QAT variants dramatically improve quantization robustness — STE nearly eliminates the quant penalty entirely. However, both show **higher cos_prev and cos_encoder than even shortcut consistency**, meaning loop differentiation decreases similarly regardless of whether the regularization targets the weights (QAT) or the representations (shortcut).
+
+The key difference: despite similar loop dynamics, QAT achieves much better roundtrip bpb because it makes the *weights* robust to rounding, not just the *representations*. Shortcut consistency constrains representations to a decoder-friendly subspace; QAT constrains weights to survive quantization. The weight-level approach is strictly more effective for the actual competition metric.
+
+STE > noise because it exactly matches the export format's rounding behavior rather than approximating it with continuous noise. The model learns to place weights where rounding will land them correctly.
+
+### Probe assets
+
+- [Noise QAT probe summary](assets/recurrent_block_probe_20260326T043602Z_noisy_qat_3min_20260325/summary.json)
+- [STE QAT probe summary](assets/recurrent_block_probe_20260326T050543Z_ste_qat_3min_20260325/summary.json)
+
+## Finding 6: 10-Min STE QAT — Quant Drift Eliminated, Loops 2-3 Collapse to Identity
+
+A full 10-minute STE QAT run with strided eval (stride 64) confirms the quant penalty is fully solved at scale, but reveals that later loops become near-identity with longer training.
+
+### Run
+
+| Run | Training budget | Steps | QAT activated at | Run ID |
+| --- | --- | --- | --- | --- |
+| STE QAT 10-min | 600s wallclock | 910 | step 673 (420.5s) | `20260326T053304Z_ste_qat_10min_strided_20260325` |
+
+Same architecture (`4/3x3/4`), commit `ca4e2fd`. `QAT_FRACTION=0.3`, `QAT_MODE=ste`, `EVAL_STRIDED_ATTN=1`, `EVAL_STRIDE=64`.
+
+### Training metrics
+
+| Metric | Value |
+| --- | --- |
+| steps | 910 |
+| val bpb (strided) | 1.3487 |
+| roundtrip bpb | **1.3490** |
+| **quant penalty** | **+0.0003** |
+| compressed model | 17.7 MB |
+| step avg | 660 ms |
+
+For comparison, the non-recurrent baseline from the int6 experiment achieved **1.276 roundtrip bpb** — the recurrent model is still 0.073 bpb behind despite near-zero quant penalty.
+
+### Probe comparison: 3-min vs 10-min
+
+| Metric | Loop | 3-min baseline | 3-min STE QAT | **10-min STE QAT** |
+| --- | --- | --- | --- | --- |
+| rel_update_norm | 1 | `4.72` | `5.79` | **`9.36`** |
+| | 2 | `0.95` | `0.78` | **`0.18`** |
+| | 3 | `0.49` | `0.44` | **`0.15`** |
+| cos_prev | 1 | `0.243` | `0.308` | `0.303` |
+| | 2 | `0.869` | `0.908` | **`0.979`** |
+| | 3 | `0.966` | `0.973` | **`0.989`** |
+| cos_encoder | 1 | `0.243` | `0.308` | `0.303` |
+| | 2 | `0.108` | `0.217` | **`0.276`** |
+| | 3 | `0.046` | `0.165` | **`0.255`** |
+| time_sensitivity | 1 | `0.000` | `0.000` | `0.000` |
+| | 2 | `0.016` | `0.017` | **`0.029`** |
+| | 3 | `0.035` | `0.037` | **`0.074`** |
+
+### Quantization drift — fully eliminated
+
+| State | 3-min baseline | 3-min STE QAT | **10-min STE QAT** |
+| --- | --- | --- | --- |
+| encoder | `0.998` | `0.998` | `0.998` |
+| loop 1 | `0.827` | `0.945` | **`0.999`** |
+| loop 2 | `0.783` | `0.932` | **`0.998`** |
+| loop 3 | `0.741` | `0.916` | **`0.998`** |
+
+### Interpretation
+
+**Quant drift is completely solved.** cos(raw,quant) ≥ 0.998 at every loop — the model has fully learned to survive int8 rounding with more training time for the STE path to work.
+
+**Loops 2-3 collapse to near-identity.** Update norms at loops 2-3 dropped to 0.18/0.15 (vs 0.95/0.49 at 3-min baseline), and cos_prev reached 0.979/0.989. Loop 1 does all the heavy lifting (update norm 9.36). The model is paying for 3 loops but effectively only using 1.
+
+**Time sensitivity is finally emerging.** Loop 3 reached 0.074 (2x the 3-min value). The model is starting to learn loop-index-dependent behavior, but loop 1 remains completely insensitive (0.000 — it always sees t=0).
+
+**The bottleneck is speed, not quantization.** At 660ms/step × 910 steps, the recurrent model trains much less than a non-recurrent model would in the same 10-min budget. The 0.073 bpb gap to the non-recurrent baseline is a training-step deficit, not a quantization problem.
+
+### Probe assets
+
+- [10-min STE QAT probe summary](assets/recurrent_block_probe_20260326T053304Z_ste_qat_10min_strided_20260325/summary.json)
+
 ## Conclusions
 
 1. **Gate-init fix resolved the identity collapse.** The recurrent blocks are now producing meaningful, non-degenerate transformations. This is the prerequisite for recurrence to help.
@@ -139,15 +343,20 @@ Plots (2-min run):
 
 4. **Int8 quantization compounds across recurrent loops.** This is the binding new constraint. At 186 steps of training, the quantized state after 3 loops is only 0.74 cosine with the raw state, and the roundtrip bpb penalty is 0.31. This penalty will likely grow with longer training as the recurrent transformations become sharper.
 
+5. **Shortcut consistency reduces quant penalty but limits loop expressiveness.** With weight=0.1, quant penalty drops 40% (+0.309 → +0.186 bpb) and cos(raw,quant) at loop 3 improves from 0.741 → 0.835. But loops 2–3 become less differentiated (cos_prev increases) and stay closer to the encoder output. The loss constrains the recurrence to a decoder-friendly subspace — good for quantization, but potentially capping the value of additional loops.
+
+6. **STE QAT nearly eliminates the quant penalty.** Late STE fake-quantize (last 30% of training) reduces the quant penalty to +0.009 bpb at 3 min and **+0.0003 bpb at 10 min**. This is strictly better than shortcut consistency (+0.186) and noise QAT (+0.087). STE achieves the best roundtrip bpb because it exactly matches the export format's rounding behavior.
+
+7. **Loops 2-3 collapse to near-identity at scale.** With 10 min of training + STE QAT, loop 1 does all the work (update norm 9.36) while loops 2-3 are near-no-ops (0.18/0.15). cos_prev at loop 3 reaches 0.989. The model is paying for 3 loops but effectively only using 1. Time sensitivity is finally emerging at loop 3 (0.074) but remains negligible.
+
+8. **The bottleneck is speed, not quantization.** The recurrent 10-min model achieves 1.349 roundtrip bpb vs 1.276 for the non-recurrent baseline — a 0.073 gap. Quant penalty is zero, so the entire gap is from fewer training steps at 660ms/step.
+
 ## Implications for Next Steps
 
-The quantization drift problem creates a tension:
-- More recurrent loops = more model capacity in raw fp32/bf16
-- More recurrent loops = more quantization damage in the int8 submission
-- The marginal value of each additional loop decreases (diminishing update norms) while the marginal quantization cost increases (compounding error)
+The quantization problem is fully solved by STE QAT. The binding constraint is now step throughput — the recurrent model trains fewer steps in the same wallclock budget.
 
-Possible directions:
-- **Quantization-aware training:** Add a quantization-roundtrip penalty to the training loss so the model learns representations that survive int8
-- **Per-loop quantization calibration:** Calibrate int8 scales separately for each recurrent loop rather than globally
-- **Fewer but stronger loops:** Trade loop count for per-loop capacity (e.g., 2 loops with more layers per loop instead of 3 loops)
-- **Residual dampening:** Scale the recurrent update by a learned factor < 1 to reduce error amplification
+Remaining directions:
+- **Fewer encoder/decoder layers with more loops:** Trade encoder/decoder depth for recurrent depth (e.g., 2/3xN/2) to reduce step time while keeping parameter-shared capacity.
+- **Loop curriculum:** Start with fewer loops (fast per-step) and ramp up later, maximizing early-training throughput.
+- **Pre-warm QAT graph during warmup:** Eliminate the ~40s torch.compile retrace cost.
+- **Damped residual:** `x = alpha * loop_output + (1-alpha) * x` to mechanically bound error amplification per loop.

@@ -1,0 +1,77 @@
+{
+  "run_dir": "/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260326T050543Z_ste_qat_3min_20260325",
+  "probe": {
+    "batch_size": 2,
+    "seq_len": 256,
+    "offset": 4096,
+    "device": "cpu"
+  },
+  "raw_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 5.792844295501709,
+      "cos_prev": 0.3076924979686737,
+      "cos_encoder": 0.3076924979686737,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.7810006141662598,
+      "cos_prev": 0.9083676934242249,
+      "cos_encoder": 0.21693259477615356,
+      "time_sensitivity_rel": 0.01670742593705654
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.4428234100341797,
+      "cos_prev": 0.9726131558418274,
+      "cos_encoder": 0.16517721116542816,
+      "time_sensitivity_rel": 0.03698167949914932
+    }
+  ],
+  "quant_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 5.709620952606201,
+      "cos_prev": 0.3083879053592682,
+      "cos_encoder": 0.3083879053592682,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.7823683023452759,
+      "cos_prev": 0.9059924483299255,
+      "cos_encoder": 0.21777336299419403,
+      "time_sensitivity_rel": 0.017855551093816757
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.44626495242118835,
+      "cos_prev": 0.9713118672370911,
+      "cos_encoder": 0.16591529548168182,
+      "time_sensitivity_rel": 0.03913168981671333
+    }
+  ],
+  "raw_quant_summary": [
+    {
+      "loop": 0.0,
+      "raw_quant_rel_diff": 0.06769252568483353,
+      "raw_quant_cos": 0.9976539611816406
+    },
+    {
+      "loop": 1.0,
+      "raw_quant_rel_diff": 0.3271673619747162,
+      "raw_quant_cos": 0.9450752139091492
+    },
+    {
+      "loop": 2.0,
+      "raw_quant_rel_diff": 0.3645913600921631,
+      "raw_quant_cos": 0.9318313002586365
+    },
+    {
+      "loop": 3.0,
+      "raw_quant_rel_diff": 0.4045276343822479,
+      "raw_quant_cos": 0.9163556098937988
+    }
+  ]
+}
