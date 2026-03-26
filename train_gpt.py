@@ -90,6 +90,7 @@ class Hyperparameters:
         num_recurrent_layers = 3
         num_decoder_layers = 3
     num_recurrent_loops = int(os.environ.get("NUM_RECURRENT_LOOPS", 2))
+    shortcut_consistency_weight = float(os.environ.get("SHORTCUT_CONSISTENCY_WEIGHT", 0.0))
     recurrent_loop_schedule = bool(int(os.environ.get("RECURRENT_LOOP_SCHEDULE", "0")))
     recurrent_loop_schedule_mode = os.environ.get("RECURRENT_LOOP_SCHEDULE_MODE", "auto")
     recurrent_loop_schedule_first_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_FIRST_FRAC", 0.5))
@@ -1040,6 +1041,7 @@ class GPT(nn.Module):
         num_recurrent_mid_layers: int,
         num_decoder_layers: int,
         num_recurrent_loops: int,
+        shortcut_consistency_weight: float,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -1066,6 +1068,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.num_recurrent_loops = num_recurrent_loops
         self.active_recurrent_loops = num_recurrent_loops
+        self.shortcut_consistency_weight = shortcut_consistency_weight
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.encoder_blocks = nn.ModuleList(
@@ -1126,18 +1129,69 @@ class GPT(nn.Module):
     def set_active_recurrent_loops(self, active_loops: int) -> None:
         self.active_recurrent_loops = max(1, min(active_loops, self.num_recurrent_loops))
 
+    def _decode(self, x: Tensor, x0: Tensor, skips: list[Tensor]) -> Tensor:
+        for i in range(self.num_decoder_layers):
+            skip_idx = self.num_encoder_layers - 1 - i
+            if 0 <= skip_idx < len(skips):
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips[skip_idx]
+            x = self.decoder_blocks[i](x, x0)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.forward_internal(input_ids)
         targets = target_ids.reshape(-1)
+        if self.training and self.shortcut_consistency_weight > 0 and self.active_recurrent_loops > 1:
+            logits, shortcut_logits = self._forward_with_shortcut(input_ids)
+            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+            shortcut_loss = F.cross_entropy(shortcut_logits.float(), targets, reduction="mean")
+            return main_loss + self.shortcut_consistency_weight * shortcut_loss
+        logits = self.forward_internal(input_ids)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
-    
+
+    def _forward_with_shortcut(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        for i in range(self.num_encoder_layers):
+            x = self.encoder_blocks[i](x, x0)
+            skips.append(x)
+
+        # Pick a random shortcut depth in [1, active_recurrent_loops).
+        # Use one_hot mask to capture the state without graph-breaking branches.
+        shortcut_idx = torch.randint(1, self.active_recurrent_loops, (), device=x.device)
+        shortcut_mask = F.one_hot(shortcut_idx, self.active_recurrent_loops).to(dtype=x.dtype)
+        shortcut_state = torch.zeros_like(x)
+
+        for i in range(self.active_recurrent_loops):
+            ti = torch.full(
+                (x.size(0), 1),
+                i / self.num_recurrent_loops,
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+            for j in range(self.num_recurrent_mid_layers):
+                c = self.time_embedder(ti)
+                x = self.recurrent_blocks[j](x, c)
+            shortcut_state = shortcut_state + shortcut_mask[i] * (x - shortcut_state)
+
+        logits = self._decode(x, x0, skips)
+        shortcut_logits = self._decode(shortcut_state, x0, skips)
+        return logits, shortcut_logits
+
     def forward_internal(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.encoder_blocks[i](x, x0)
             skips.append(x)
@@ -1152,21 +1206,9 @@ class GPT(nn.Module):
             for j in range(self.num_recurrent_mid_layers):
                 c = self.time_embedder(ti)
                 x = self.recurrent_blocks[j](x, c)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.decoder_blocks[i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return logits
-    
+        return self._decode(x, x0, skips)
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         return self.forward_internal(input_ids)
 
@@ -1275,6 +1317,7 @@ def main() -> None:
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
+        shortcut_consistency_weight=args.shortcut_consistency_weight,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,

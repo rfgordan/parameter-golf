@@ -72,6 +72,7 @@ def build_model(run_dir: Path, model_path: Path, device: torch.device) -> tuple[
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
+        shortcut_consistency_weight=0.0,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
