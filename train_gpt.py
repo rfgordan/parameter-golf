@@ -1221,7 +1221,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, _QAT_SCALE
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -1609,7 +1609,6 @@ def main() -> None:
         # Pre-warm the QAT code path so torch.compile traces it now, not mid-training.
         # Without this, flipping _QAT_SCALE triggers a ~40s retrace during the run.
         if args.qat_fraction > 0:
-            global _QAT_SCALE
             _QAT_SCALE = 1.0
             zero_grad_all()
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -1703,7 +1702,7 @@ def main() -> None:
         last_scheduled_recurrent_loops = scheduled_loops
 
         # Late QAT: activate noisy quantization in the last qat_fraction of training.
-        global _QAT_SCALE
+        # (global _QAT_SCALE declared in warmup block above)
         if args.qat_fraction > 0 and max_wallclock_ms is not None:
             qat_start_ms = max_wallclock_ms * (1.0 - args.qat_fraction)
             should_be_active = elapsed_ms >= qat_start_ms
@@ -1786,7 +1785,7 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-    _QAT_ACTIVE = False  # noqa: F841 — Ensure clean weights for serialization.
+    _QAT_SCALE = 0.0  # Ensure clean weights for serialization.
     set_eval_recurrent_loops()
     serialize_and_validate_roundtrip(
         args,
