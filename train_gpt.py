@@ -98,6 +98,7 @@ class Hyperparameters:
     recurrent_loop_schedule_second_frac = float(os.environ.get("RECURRENT_LOOP_SCHEDULE_SECOND_FRAC", 0.25))
     recurrent_loop_sample = bool(int(os.environ.get("RECURRENT_LOOP_SAMPLE", "0")))
     recurrent_loop_sample_choices = os.environ.get("RECURRENT_LOOP_SAMPLE_CHOICES", "1,2,3,4")
+    recurrent_adapter_dim = int(os.environ.get("RECURRENT_ADAPTER_DIM", os.environ.get("LOOP_ADAPTER_DIM", "0")))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -499,7 +500,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,adaLN_modulation,time_embedder",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,adaLN_modulation,time_embedder,adapter_scale",
     ).split(",")
     if pattern
 )
@@ -1035,6 +1036,23 @@ class LoopFormerBlock(nn.Module):
         )
         return x
 
+
+class LoopAdapter(nn.Module):
+    # Per-loop residual adapter bank, following the Looped Transformer PR325 pattern.
+    def __init__(self, dim: int, adapter_dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.down = CastedLinear(dim, adapter_dim, bias=False)
+        self.up = CastedLinear(adapter_dim, dim, bias=False)
+        self.up._zero_init = True
+        self.adapter_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = torch.relu(self.down(self.norm(x)))
+        h = self.up(h.square())
+        return self.adapter_scale.to(dtype=x.dtype)[None, None, :] * h
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
@@ -1072,6 +1090,7 @@ class GPT(nn.Module):
         num_recurrent_mid_layers: int,
         num_decoder_layers: int,
         num_recurrent_loops: int,
+        recurrent_adapter_dim: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -1084,6 +1103,8 @@ class GPT(nn.Module):
     ):
         if num_recurrent_loops < 2:
             raise ValueError("Code requires num_recurrent_loops > 1")
+        if recurrent_adapter_dim < 0:
+            raise ValueError(f"recurrent_adapter_dim must be >=0, got {recurrent_adapter_dim}")
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -1097,6 +1118,7 @@ class GPT(nn.Module):
         self.num_recurrent_mid_layers = num_recurrent_mid_layers
         self.num_decoder_layers = num_decoder_layers
         self.num_recurrent_loops = num_recurrent_loops
+        self.recurrent_adapter_dim = recurrent_adapter_dim
         self.active_recurrent_loops = num_recurrent_loops
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -1126,6 +1148,12 @@ class GPT(nn.Module):
                 for i in range(num_recurrent_mid_layers)
             ]
         )
+        self.recurrent_adapters = nn.ModuleList(
+            [
+                LoopAdapter(model_dim, recurrent_adapter_dim)
+                for _ in range(num_recurrent_mid_layers * num_recurrent_loops)
+            ]
+        ) if recurrent_adapter_dim > 0 else nn.ModuleList()
         # one time step embedding, fixed step and trajectory length
         self.time_embedder = TimestepEmbedder(model_dim)
         self.decoder_blocks = nn.ModuleList(
@@ -1157,6 +1185,11 @@ class GPT(nn.Module):
 
     def set_active_recurrent_loops(self, active_loops: int) -> None:
         self.active_recurrent_loops = max(1, min(active_loops, self.num_recurrent_loops))
+
+    def _recurrent_adapter(self, loop_idx: int, block_idx: int) -> LoopAdapter | None:
+        if len(self.recurrent_adapters) == 0:
+            return None
+        return self.recurrent_adapters[loop_idx * self.num_recurrent_mid_layers + block_idx]
 
     def _decode(self, x: Tensor, x0: Tensor, skips: list[Tensor]) -> Tensor:
         for i in range(self.num_decoder_layers):
@@ -1198,6 +1231,9 @@ class GPT(nn.Module):
             for j in range(self.num_recurrent_mid_layers):
                 c = self.time_embedder(ti)
                 x = self.recurrent_blocks[j](x, c)
+                adapter = self._recurrent_adapter(i, j)
+                if adapter is not None:
+                    x = x + adapter(x)
 
         return self._decode(x, x0, skips)
 
@@ -1309,6 +1345,7 @@ def main() -> None:
         num_recurrent_mid_layers=args.num_recurrent_layers,
         num_decoder_layers=args.num_decoder_layers,
         num_recurrent_loops=args.num_recurrent_loops,
+        recurrent_adapter_dim=args.recurrent_adapter_dim,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1341,6 +1378,7 @@ def main() -> None:
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.encoder_blocks.named_parameters())
     block_named_params.extend(base_model.recurrent_blocks.named_parameters())
+    block_named_params.extend(base_model.recurrent_adapters.named_parameters())
     block_named_params.extend(base_model.decoder_blocks.named_parameters())
     matrix_params = [
         p
@@ -1411,6 +1449,8 @@ def main() -> None:
         )
     if args.recurrent_loop_sample:
         log0(f"recurrent_loop_sample:choices={args.recurrent_loop_sample_choices}")
+    if args.recurrent_adapter_dim > 0:
+        log0(f"recurrent_adapter_dim:{args.recurrent_adapter_dim}")
     log0(f"seed:{args.seed}")
     if args.init_model_path:
         log0(f"init_model_path:{args.init_model_path}")
