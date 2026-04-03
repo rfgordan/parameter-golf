@@ -13,6 +13,7 @@ import io
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -60,9 +61,17 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
+    train_only = bool(int(os.environ.get("TRAIN_ONLY", "0")))
     init_model_path = os.environ.get("INIT_MODEL_PATH", "")
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     qat_fraction = float(os.environ.get("QAT_FRACTION", 1.0))
+    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "0")))
+    wandb_project = os.environ.get("WANDB_PROJECT", "parameter-golf")
+    wandb_entity = os.environ.get("WANDB_ENTITY", "")
+    wandb_mode = os.environ.get("WANDB_MODE", "online")
+    wandb_group = os.environ.get("WANDB_GROUP", "")
+    wandb_tags = os.environ.get("WANDB_TAGS", "")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", "")
     
     # Strided Attn Params
     eval_strided_attn = bool(int(os.environ.get("EVAL_STRIDED_ATTN", "0")))
@@ -686,6 +695,10 @@ def load_model_state_dict(path: str) -> dict[str, Tensor]:
     return state_dict
 
 
+def slugify_label(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def serialize_and_validate_roundtrip(
     args: Hyperparameters,
     code: str,
@@ -702,9 +715,10 @@ def serialize_and_validate_roundtrip(
     log0,
     distributed: bool,
     master_process: bool,
-) -> None:
+) -> dict[str, float | int | str]:
     quant_name = "int6+zlib" if USE_INT6 else "int8+zlib"
     quant_ext = "int6.ptz" if USE_INT6 else "int8.ptz"
+    metrics: dict[str, float | int | str] = {"quant_name": quant_name}
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -712,6 +726,9 @@ def serialize_and_validate_roundtrip(
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        metrics["model_bytes"] = model_bytes
+        metrics["code_bytes"] = code_bytes
+        metrics["submission_bytes"] = model_bytes + code_bytes
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
@@ -730,6 +747,11 @@ def serialize_and_validate_roundtrip(
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size {quant_name}: {quant_file_bytes + code_bytes} bytes")
+        metrics["quant_model_bytes"] = quant_file_bytes
+        metrics["quant_submission_bytes"] = quant_file_bytes + code_bytes
+        metrics["quant_payload_bytes"] = quant_stats["int8_payload_bytes"]
+        metrics["quant_raw_bytes"] = quant_raw_bytes
+        metrics["quant_payload_ratio"] = ratio
 
     if distributed:
         dist.barrier()
@@ -757,6 +779,10 @@ def serialize_and_validate_roundtrip(
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_{quant_name.replace('+', '_')}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    metrics["roundtrip_val_loss"] = q_val_loss
+    metrics["roundtrip_val_bpb"] = q_val_bpb
+    metrics["roundtrip_eval_ms"] = 1000.0 * (time.perf_counter() - t_qeval)
+    return metrics
 
 
 # -----------------------------
@@ -1273,6 +1299,8 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
+    gpu_name = torch.cuda.get_device_name(device)
+    gpu_slug = slugify_label(gpu_name)
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1299,6 +1327,29 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    wandb_run = None
+
+    def wandb_log(metrics: dict[str, float | int | str], *, step: int | None = None) -> None:
+        nonlocal wandb_run
+        if wandb_run is None:
+            return
+        try:
+            wandb_run.log(metrics, step=step)
+        except Exception as exc:
+            log0(f"wandb:log_failed error={exc}")
+            wandb_run = None
+
+    def wandb_summary_update(metrics: dict[str, float | int | str]) -> None:
+        nonlocal wandb_run
+        if wandb_run is None:
+            return
+        try:
+            for key, value in metrics.items():
+                wandb_run.summary[key] = value
+        except Exception as exc:
+            log0(f"wandb:summary_failed error={exc}")
+            wandb_run = None
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1308,6 +1359,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    log0(f"gpu_name:{gpu_name}")
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -1456,6 +1508,66 @@ def main() -> None:
         log0(f"init_model_path:{args.init_model_path}")
     if args.eval_only:
         log0("eval_only:1")
+    if args.train_only:
+        log0("train_only:1")
+
+    if args.eval_only and args.train_only:
+        raise ValueError("EVAL_ONLY and TRAIN_ONLY cannot both be enabled")
+
+    if master_process and args.wandb_enabled:
+        try:
+            import wandb  # type: ignore
+
+            wandb_name = args.wandb_run_name or f"{args.run_id}__{gpu_slug}"
+            wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+            if gpu_slug not in wandb_tags:
+                wandb_tags.append(gpu_slug)
+            wandb_kwargs = {
+                "project": args.wandb_project,
+                "name": wandb_name,
+                "id": args.run_id,
+                "resume": "allow",
+                "config": {
+                    "run_id": args.run_id,
+                    "gpu_name": gpu_name,
+                    "world_size": world_size,
+                    "grad_accum_steps": grad_accum_steps,
+                    "model_params": n_params,
+                    "train_batch_tokens": args.train_batch_tokens,
+                    "train_seq_len": args.train_seq_len,
+                    "iterations": args.iterations,
+                    "max_wallclock_seconds": args.max_wallclock_seconds,
+                    "vocab_size": args.vocab_size,
+                    "num_encoder_layers": args.num_encoder_layers,
+                    "num_recurrent_layers": args.num_recurrent_layers,
+                    "num_decoder_layers": args.num_decoder_layers,
+                    "num_recurrent_loops": args.num_recurrent_loops,
+                    "recurrent_adapter_dim": args.recurrent_adapter_dim,
+                    "model_dim": args.model_dim,
+                    "num_heads": args.num_heads,
+                    "num_kv_heads": args.num_kv_heads,
+                    "mlp_mult": args.mlp_mult,
+                    "qat_enabled": args.qat_enabled,
+                    "qat_fraction": args.qat_fraction,
+                    "eval_strided_attn": args.eval_strided_attn,
+                    "eval_doc_separated": args.eval_doc_separated,
+                    "eval_seq_len": args.eval_seq_len,
+                    "eval_stride": args.eval_stride,
+                    "use_int6": USE_INT6,
+                },
+                "tags": wandb_tags,
+                "mode": args.wandb_mode,
+            }
+            if args.wandb_entity:
+                wandb_kwargs["entity"] = args.wandb_entity
+            if args.wandb_group:
+                wandb_kwargs["group"] = args.wandb_group
+            wandb_run = wandb.init(**wandb_kwargs)
+            if wandb_run is not None:
+                wandb_summary_update({"gpu_name": gpu_name, "model_params": n_params})
+                log0(f"wandb:enabled project={args.wandb_project} name={wandb_name}")
+        except Exception as exc:
+            log0(f"wandb:init_failed error={exc}")
 
     if args.eval_only:
         base_model.set_active_recurrent_loops(base_model.num_recurrent_loops)
@@ -1482,7 +1594,7 @@ def main() -> None:
             f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
         )
         base_model.set_active_recurrent_loops(base_model.num_recurrent_loops)
-        serialize_and_validate_roundtrip(
+        roundtrip_metrics = serialize_and_validate_roundtrip(
             args,
             code,
             base_model,
@@ -1499,6 +1611,19 @@ def main() -> None:
             distributed,
             master_process,
         )
+        wandb_log(
+            {
+                "val/loss": val_loss,
+                "val/bpb": val_bpb,
+                "perf/eval_ms": eval_ms,
+                "perf/peak_mem_allocated_mib": torch.cuda.max_memory_allocated() // 1024 // 1024,
+                "perf/peak_mem_reserved_mib": torch.cuda.max_memory_reserved() // 1024 // 1024,
+            },
+            step=0,
+        )
+        wandb_summary_update(roundtrip_metrics)
+        if wandb_run is not None:
+            wandb_run.finish()
         if distributed:
             dist.destroy_process_group()
         return
@@ -1693,6 +1818,16 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            wandb_log(
+                {
+                    "val/loss": val_loss,
+                    "val/bpb": val_bpb,
+                    "perf/train_time_ms": training_time_ms,
+                    "perf/step_avg_ms": training_time_ms / max(step, 1),
+                    "schedule/active_recurrent_loops": base_model.num_recurrent_loops,
+                },
+                step=step,
+            )
             if train_loss_counts:
                 log0(f"loop_train_stats:{format_loop_train_stats()}")
             log0(f"loop_val_stats:{format_loop_val_stats()}")
@@ -1712,6 +1847,7 @@ def main() -> None:
         set_qat_strength(base_model, qat_strength)
         if qat_strength != last_qat_strength:
             log0(f"qat_schedule_update step:{step}/{args.iterations} qat_strength:{qat_strength:.2f}")
+            wandb_log({"qat/strength": qat_strength}, step=step)
             last_qat_strength = qat_strength
         scheduled_loops = scheduled_recurrent_loops(step, elapsed_ms)
         active_recurrent_loops = sampled_recurrent_loops(scheduled_loops)
@@ -1729,6 +1865,14 @@ def main() -> None:
                 f"scheduled_recurrent_loops:{scheduled_loops} "
                 f"active_recurrent_loops:{active_recurrent_loops} "
                 f"progress:{progress:.4f}"
+            )
+            wandb_log(
+                {
+                    "schedule/progress": progress,
+                    "schedule/scheduled_recurrent_loops": scheduled_loops,
+                    "schedule/active_recurrent_loops": active_recurrent_loops,
+                },
+                step=step,
             )
         last_active_recurrent_loops = active_recurrent_loops
         last_scheduled_recurrent_loops = scheduled_loops
@@ -1775,6 +1919,18 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            wandb_log(
+                {
+                    "train/loss": train_loss.item(),
+                    "perf/train_time_ms": approx_training_time_ms,
+                    "perf/step_avg_ms": approx_training_time_ms / step,
+                    "optim/lr_scale": scale,
+                    "optim/muon_momentum": muon_momentum,
+                    "schedule/active_recurrent_loops": active_recurrent_loops,
+                    "schedule/scheduled_recurrent_loops": scheduled_loops,
+                },
+                step=step,
+            )
             log0(f"loop_train_stats:{format_loop_train_stats()}")
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1790,6 +1946,37 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    peak_mem_allocated_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
+    peak_mem_reserved_mib = torch.cuda.max_memory_reserved() // 1024 // 1024
+    wandb_summary_update(
+        {
+            "perf/peak_mem_allocated_mib": peak_mem_allocated_mib,
+            "perf/peak_mem_reserved_mib": peak_mem_reserved_mib,
+            "train/final_step": step,
+            "train/final_time_ms": training_time_ms,
+            "train/last_active_recurrent_loops": last_active_recurrent_loops or base_model.num_recurrent_loops,
+        }
+    )
+
+    if args.train_only:
+        if master_process:
+            torch.save(base_model.state_dict(), "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+            wandb_summary_update(
+                {
+                    "artifact/model_bytes": model_bytes,
+                    "artifact/submission_bytes": model_bytes + code_bytes,
+                }
+            )
+        if wandb_run is not None:
+            wandb_run.finish()
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1797,7 +1984,7 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
     set_eval_recurrent_loops()
-    serialize_and_validate_roundtrip(
+    roundtrip_metrics = serialize_and_validate_roundtrip(
         args,
         code,
         base_model,
@@ -1814,6 +2001,21 @@ def main() -> None:
         distributed,
         master_process,
     )
+    wandb_summary_update(roundtrip_metrics)
+    if wandb_run is not None:
+        quant_name_slug = str(roundtrip_metrics["quant_name"]).replace("+", "_")
+        wandb_log(
+            {
+                f"roundtrip/{quant_name_slug}_val_loss": float(roundtrip_metrics["roundtrip_val_loss"]),
+                f"roundtrip/{quant_name_slug}_val_bpb": float(roundtrip_metrics["roundtrip_val_bpb"]),
+                "artifact/model_bytes": int(roundtrip_metrics.get("model_bytes", 0)),
+                "artifact/quant_model_bytes": int(roundtrip_metrics.get("quant_model_bytes", 0)),
+                "artifact/submission_bytes": int(roundtrip_metrics.get("submission_bytes", 0)),
+                "artifact/quant_submission_bytes": int(roundtrip_metrics.get("quant_submission_bytes", 0)),
+            },
+            step=step,
+        )
+        wandb_run.finish()
 
     if distributed:
         dist.destroy_process_group()

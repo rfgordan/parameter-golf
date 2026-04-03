@@ -243,6 +243,15 @@ def load_runs(batch_file: Path) -> list[dict[str, Any]]:
     raise ValueError("batch file must contain a JSON object or list of objects")
 
 
+def pod_env_for_payload(payload: dict[str, Any]) -> dict[str, str]:
+    pod_env = {str(k): str(v) for k, v in payload.get("pod_env", {}).items()}
+    env_overrides = {str(k): str(v) for k, v in payload.get("env_overrides", {}).items()}
+    wandb_enabled = env_overrides.get("WANDB_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if wandb_enabled:
+        pod_env.setdefault("WANDB_API_KEY", "{{ RUNPOD_SECRET_WANDB_API_KEY }}")
+    return pod_env
+
+
 def prepare_payload(
     payload: dict[str, Any],
     remote_root: str,
@@ -303,6 +312,7 @@ def make_record(payload: dict[str, Any]) -> tuple[dict[str, Any], Path]:
             "template_id": prepared_payload.get("template_id") or DEFAULT_TEMPLATE_ID,
             "image_name": prepared_payload.get("image_name") or DEFAULT_IMAGE_NAME,
             "cloud_type": str(prepared_payload.get("cloud_type") or DEFAULT_CLOUD_TYPE).upper(),
+            "env": pod_env_for_payload(prepared_payload),
         },
         "remote": {
             "root": remote_root,
@@ -345,6 +355,9 @@ def create_pod(record: dict[str, Any]) -> str:
         record["pod"]["cloud_type"],
         "--ssh",
     ]
+    pod_env = record["pod"].get("env") or {}
+    if pod_env:
+        cmd.extend(["--env", json.dumps(pod_env, separators=(",", ":"))])
     if record["pod"]["template_id"]:
         cmd.extend(["--template-id", record["pod"]["template_id"]])
     cmd.extend(["--image", record["pod"]["image_name"]])
