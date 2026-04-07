@@ -50,6 +50,17 @@ cd "\${REPO_DIR}"
 git fetch --depth 1 origin "\${GIT_REF}" >/dev/null 2>&1 || true
 git checkout "\${GIT_REF}" >/dev/null 2>&1 || git checkout FETCH_HEAD >/dev/null 2>&1
 
+if python3 - <<'PY' "\${REMOTE_PAYLOAD_PATH}" >/dev/null 2>&1
+import json, sys
+payload = json.load(open(sys.argv[1]))
+env = {str(k): str(v) for k, v in payload.get("env_overrides", {}).items()}
+enabled = env.get("WANDB_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+raise SystemExit(0 if enabled else 1)
+PY
+then
+  python3 -m pip install wandb >/dev/null
+fi
+
 printf '%s\n' "data_setup" > "\${REMOTE_RUN_DIR}/.runpod_status"
 python3 data/cached_challenge_fineweb.py --variant "\${DATASET_VARIANT}" --train-shards "\${TRAIN_SHARDS}"
 

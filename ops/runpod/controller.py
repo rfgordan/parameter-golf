@@ -243,6 +243,15 @@ def load_runs(batch_file: Path) -> list[dict[str, Any]]:
     raise ValueError("batch file must contain a JSON object or list of objects")
 
 
+def pod_env_for_payload(payload: dict[str, Any]) -> dict[str, str]:
+    pod_env = {str(k): str(v) for k, v in payload.get("pod_env", {}).items()}
+    env_overrides = {str(k): str(v) for k, v in payload.get("env_overrides", {}).items()}
+    wandb_enabled = env_overrides.get("WANDB_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if wandb_enabled:
+        pod_env.setdefault("WANDB_API_KEY", "{{ RUNPOD_SECRET_WANDB_API_KEY }}")
+    return pod_env
+
+
 def prepare_payload(
     payload: dict[str, Any],
     remote_root: str,
@@ -303,6 +312,7 @@ def make_record(payload: dict[str, Any]) -> tuple[dict[str, Any], Path]:
             "template_id": prepared_payload.get("template_id") or DEFAULT_TEMPLATE_ID,
             "image_name": prepared_payload.get("image_name") or DEFAULT_IMAGE_NAME,
             "cloud_type": str(prepared_payload.get("cloud_type") or DEFAULT_CLOUD_TYPE).upper(),
+            "env": pod_env_for_payload(prepared_payload),
         },
         "remote": {
             "root": remote_root,
@@ -345,6 +355,9 @@ def create_pod(record: dict[str, Any]) -> str:
         record["pod"]["cloud_type"],
         "--ssh",
     ]
+    pod_env = record["pod"].get("env") or {}
+    if pod_env:
+        cmd.extend(["--env", json.dumps(pod_env, separators=(",", ":"))])
     if record["pod"]["template_id"]:
         cmd.extend(["--template-id", record["pod"]["template_id"]])
     cmd.extend(["--image", record["pod"]["image_name"]])
@@ -473,6 +486,79 @@ def remote_exit_code(record: dict[str, Any]) -> tuple[bool, int | None, str]:
     return exit_code is not None, exit_code, status
 
 
+REQUIRED_EGRESS_FILES = ["metrics.json", "config.json", "stdout.log", "artifact_summary.json"]
+MAX_EGRESS_ATTEMPTS = 3
+
+
+def verify_egress(local_result_dir: Path) -> list[str]:
+    """Check egressed results for completeness. Returns list of problems (empty = OK)."""
+    problems: list[str] = []
+    for name in REQUIRED_EGRESS_FILES:
+        path = local_result_dir / name
+        if not path.is_file():
+            problems.append(f"missing required file: {name}")
+        elif path.stat().st_size == 0:
+            problems.append(f"empty required file: {name}")
+    summary_path = local_result_dir / "artifact_summary.json"
+    if summary_path.is_file() and summary_path.stat().st_size > 0:
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            problems.append(f"corrupt artifact_summary.json: {exc}")
+            return problems
+        for artifact in summary.get("artifacts", []):
+            remote_path = artifact.get("path", "")
+            expected_bytes = artifact.get("bytes")
+            name = Path(remote_path).name
+            local_path = local_result_dir / name
+            if not local_path.is_file():
+                problems.append(f"missing artifact: {name}")
+            elif expected_bytes is not None and local_path.stat().st_size != expected_bytes:
+                problems.append(
+                    f"size mismatch for {name}: expected {expected_bytes} got {local_path.stat().st_size}"
+                )
+    return problems
+
+
+def local_egress_manifest(local_result_dir: Path) -> dict[str, int]:
+    """Return {relative_name: size_bytes} for all files present in the local result dir."""
+    manifest: dict[str, int] = {}
+    if not local_result_dir.is_dir():
+        return manifest
+    for path in local_result_dir.rglob("*"):
+        if path.is_file():
+            manifest[str(path.relative_to(local_result_dir))] = path.stat().st_size
+    return manifest
+
+
+class EgressError(RuntimeError):
+    """Raised when egress fails, carrying structured diagnostics for the agent."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        problems: list[str],
+        local_manifest: dict[str, int],
+        pod_reachable: bool | None,
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.problems = problems
+        self.local_manifest = local_manifest
+        self.pod_reachable = pod_reachable
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "attempts": self.attempts,
+            "problems": self.problems,
+            "local_manifest": self.local_manifest,
+            "pod_reachable": self.pod_reachable,
+        }
+
+
 def egress_results(record: dict[str, Any]) -> None:
     spec = SSHSpec(
         host=record["ssh"]["host"],
@@ -483,7 +569,35 @@ def egress_results(record: dict[str, Any]) -> None:
     )
     local_result_dir = Path(record["local_result_dir"])
     local_result_dir.mkdir(parents=True, exist_ok=True)
-    scp_from_remote(spec, record["remote"]["run_dir"], local_result_dir)
+    last_problems: list[str] = []
+    for attempt in range(1, MAX_EGRESS_ATTEMPTS + 1):
+        try:
+            scp_from_remote(spec, record["remote"]["run_dir"], local_result_dir)
+        except Exception as exc:
+            last_problems = [f"scp failed: {exc}"]
+            if attempt < MAX_EGRESS_ATTEMPTS:
+                time.sleep(2 * attempt)
+                continue
+            break
+        last_problems = verify_egress(local_result_dir)
+        if not last_problems:
+            return
+        if attempt < MAX_EGRESS_ATTEMPTS:
+            time.sleep(2 * attempt)
+    pod_reachable: bool | None = None
+    try:
+        ssh_run(spec, "true", check=True)
+        pod_reachable = True
+    except Exception:
+        pod_reachable = False
+    raise EgressError(
+        f"egress verification failed after {MAX_EGRESS_ATTEMPTS} attempts: "
+        + "; ".join(last_problems),
+        attempts=MAX_EGRESS_ATTEMPTS,
+        problems=last_problems,
+        local_manifest=local_egress_manifest(local_result_dir),
+        pod_reachable=pod_reachable,
+    )
 
 
 def delete_pod(record: dict[str, Any]) -> None:
@@ -594,6 +708,11 @@ def watch_runs(*, watch: bool, interval: float) -> None:
             if completed:
                 try:
                     egress_results(record)
+                except EgressError as exc:
+                    record["egress_diagnostics"] = exc.to_dict()
+                    save_record(record)
+                    append_event(record, "egress_failed", note=str(exc))
+                    notify("egress_failed", record, extra=json.dumps(exc.to_dict()))
                 except Exception as exc:
                     append_event(record, "egress_failed", note=str(exc))
                     notify("egress_failed", record, extra=str(exc))

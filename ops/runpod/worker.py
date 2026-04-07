@@ -25,10 +25,10 @@ DEFAULT_TRAIN_COMMAND = os.environ.get(
 VAL_RE = re.compile(r"step:(?P<step>\d+)/(?P<iters>\d+) val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)")
 TRAIN_RE = re.compile(r"step:(?P<step>\d+)/(?P<iters>\d+) train_loss:(?P<train_loss>\S+)")
 ROUNDTRIP_RE = re.compile(
-    r"final_int8_zlib_roundtrip_exact val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)"
+    r"final_int(?:8|6)_zlib_roundtrip_exact val_loss:(?P<val_loss>\S+) val_bpb:(?P<val_bpb>\S+)"
 )
-TOTAL_SIZE_RE = re.compile(r"Total submission size int8\+zlib: (?P<bytes>\d+) bytes")
-SERIALIZED_RE = re.compile(r"Serialized model int8\+zlib: (?P<bytes>\d+) bytes")
+TOTAL_SIZE_RE = re.compile(r"Total submission size int(?:8|6)\+zlib: (?P<bytes>\d+) bytes")
+SERIALIZED_RE = re.compile(r"Serialized model int(?:8|6)\+zlib: (?P<bytes>\d+) bytes")
 
 
 @dataclass
@@ -179,7 +179,11 @@ def run_training(payload: dict[str, Any], paths: RunPaths) -> dict[str, Any]:
     elapsed = time.time() - started
     log_text = paths.stdout_log.read_text(encoding="utf-8")
     metrics = parse_metrics(log_text)
-    status = "success" if proc.returncode == 0 and metrics["final_roundtrip_val_bpb"] is not None else "failed"
+    env_overrides = {str(k): str(v) for k, v in payload.get("env_overrides", {}).items()}
+    train_only = env_overrides.get("TRAIN_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+    train_only_success = train_only and (paths.run_dir / "final_model.pt").is_file()
+    roundtrip_success = metrics["final_roundtrip_val_bpb"] is not None
+    status = "success" if proc.returncode == 0 and (roundtrip_success or train_only_success) else "failed"
     payload_out = {
         "status": status,
         "return_code": proc.returncode,

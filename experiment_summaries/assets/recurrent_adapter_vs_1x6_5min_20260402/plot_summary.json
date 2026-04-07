@@ -1,0 +1,19 @@
+{
+  "runs": {
+    "Adapter 2/3x3/2": {
+      "last_step": 400,
+      "last_train_loss": 2.5533,
+      "last_train_time_s": 224.355
+    },
+    "1x6 2/1x6/2": {
+      "last_step": 600,
+      "last_train_loss": 2.5599,
+      "last_train_time_s": 225.071
+    },
+    "Prior non-adapter 2/3x3/2": {
+      "last_step": 950,
+      "last_train_loss": 2.2816,
+      "last_train_time_s": 579.324
+    }
+  }
+}

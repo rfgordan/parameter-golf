@@ -1,0 +1,77 @@
+{
+  "run_dir": "/Users/robertgordan/Projects/parameter-golf/.runpod/results/20260324T232001Z_loopformer_recur_4_3x3_4_int8_h100_10min_20260324",
+  "probe": {
+    "batch_size": 2,
+    "seq_len": 256,
+    "offset": 4096,
+    "device": "cpu"
+  },
+  "raw_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0,
+      "cos_encoder": 1.0,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0,
+      "cos_encoder": 1.0,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0,
+      "cos_encoder": 1.0,
+      "time_sensitivity_rel": 0.0
+    }
+  ],
+  "quant_summary": [
+    {
+      "loop": 1.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0000001192092896,
+      "cos_encoder": 1.0000001192092896,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 2.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0000001192092896,
+      "cos_encoder": 1.0000001192092896,
+      "time_sensitivity_rel": 0.0
+    },
+    {
+      "loop": 3.0,
+      "rel_update_norm": 0.0,
+      "cos_prev": 1.0000001192092896,
+      "cos_encoder": 1.0000001192092896,
+      "time_sensitivity_rel": 0.0
+    }
+  ],
+  "raw_quant_summary": [
+    {
+      "loop": 0.0,
+      "raw_quant_rel_diff": 0.06633108854293823,
+      "raw_quant_cos": 0.9978262186050415
+    },
+    {
+      "loop": 1.0,
+      "raw_quant_rel_diff": 0.06633108854293823,
+      "raw_quant_cos": 0.9978262186050415
+    },
+    {
+      "loop": 2.0,
+      "raw_quant_rel_diff": 0.06633108854293823,
+      "raw_quant_cos": 0.9978262186050415
+    },
+    {
+      "loop": 3.0,
+      "raw_quant_rel_diff": 0.06633108854293823,
+      "raw_quant_cos": 0.9978262186050415
+    }
+  ]
+}
